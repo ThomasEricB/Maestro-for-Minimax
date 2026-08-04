@@ -17,6 +17,13 @@ _ARCHITECTURE_MAP = {
     "ltx2": "ltx2_video.md",
     "ltxv": "ltx2_video.md",
 
+    # MiniMax H3 — the two variants take structurally different prompts
+    # (FL2VA's three fields vs Ref2VA's six), so they map separately.
+    # Longest-prefix matching picks the variant over the family entry.
+    "minimax_h3": "minimax_h3_fl2va.md",
+    "minimax_h3_fl2va": "minimax_h3_fl2va.md",
+    "minimax_h3_ref2va": "minimax_h3_ref2va.md",
+
     # Wan video models
     "t2v": "wan_video.md",
     "i2v": "wan_video.md",

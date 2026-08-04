@@ -39,6 +39,7 @@ from shared.utils.loras_mutipliers import preparse_loras_multipliers, parse_lora
 from shared.utils.utils import convert_tensor_to_image, save_image, get_video_info, get_file_creation_date, convert_image_to_video, calculate_new_dimensions, convert_image_to_tensor, calculate_dimensions_and_resize_image, rescale_and_crop, get_video_frame, resize_and_remove_background, rgb_bw_to_rgba_mask, to_rgb_tensor
 from shared.utils.utils import calculate_new_dimensions, get_outpainting_frame_location, get_outpainting_full_area_dimensions
 from shared.utils.utils import has_video_file_extension, has_image_file_extension, has_audio_file_extension
+from shared.utils.frame_scheduler import floor_frame_count, normalize_frame_count
 from shared.utils.audio_video import extract_audio_tracks, combine_video_with_audio_tracks, combine_and_concatenate_video_with_audio_tracks, cleanup_temp_audio_files, normalize_audio_pair_volumes_to_temp_files, save_video, save_image
 from shared.utils.audio_video import save_image_metadata, read_image_metadata, extract_audio_track_to_wav, write_wav_file, save_audio_file, get_audio_codec_extension, append_sliding_window_audio, create_silent_wav_file
 from shared.utils.audio_metadata import save_audio_metadata, read_audio_metadata, extract_creation_datetime_from_metadata, resolve_audio_creation_datetime
@@ -111,7 +112,7 @@ lm_decoder_engine = ""
 enable_int8_kernels = 0
 # All media attachment keys for queue save/load
 ATTACHMENT_KEYS = ["image_start", "image_end", "image_refs", "image_guide", "image_mask",
-                   "video_guide",  "video_mask", "video_source", "video_end", "audio_guide", "audio_guide2", "audio_guide3", "audio_guide4", "audio_guide5", "audio_guide6", "audio_source", "custom_guide"]
+                   "video_guide", "video_guide2", "video_mask", "video_source", "video_end", "audio_guide", "audio_guide2", "audio_guide3", "audio_guide4", "audio_guide5", "audio_guide6", "audio_source", "custom_guide"]
 
 from importlib.metadata import version
 mmgp_version = version("mmgp")
@@ -136,6 +137,7 @@ _HANDLER_MODULES = [
     "shared.qtypes.nunchaku_int4",
     "shared.qtypes.nunchaku_fp4",
     "shared.qtypes.gguf",
+    "shared.qtypes.int8_convrot",
 ]
 quant_router.unregister_handler(".fp8_quanto_bridge")
 for handler in _HANDLER_MODULES:
@@ -794,8 +796,18 @@ def validate_settings(state, model_type, single_prompt, inputs):
         return ret()
 
     multi_prompts_gen_type = inputs["multi_prompts_gen_type"]
-    if single_prompt or multi_prompts_gen_type == 2:
-        prompts = [prompt] 
+    # Some models take a structured, inherently multi-line prompt (MiniMax H3's
+    # integrated_multimodal_description / overall_soundscape / non_diegetic_music
+    # block). Splitting that on newlines would turn one prompt into three
+    # separate generations, so those models opt out of line-splitting.
+    # gen_type 3 (Multi-Shot) is excluded: there the newlines ARE the clip
+    # boundaries, and collapsing them would silently drop every clip but the
+    # first. Maestro's Studio path separates H3 clips with ---CLIP_BOUNDARY---
+    # in launch.py before reaching here, so each clip arrives as gen_type 0.
+    if single_prompt or multi_prompts_gen_type == 2 or (
+        multi_prompts_gen_type != 3 and model_def.get("single_block_prompt", False)
+    ):
+        prompts = [prompt]
     else:
         prompts = [one_line.strip() for one_line in prompt.split("\n") if len(one_line.strip()) > 0]
 
@@ -867,6 +879,7 @@ def validate_settings(state, model_type, single_prompt, inputs):
     audio_guide6 = inputs.get("audio_guide6")
     audio_source = inputs["audio_source"]
     video_guide = inputs["video_guide"]
+    video_guide2 = inputs.get("video_guide2")
     image_guide = inputs["image_guide"]
     video_mask = inputs["video_mask"]
     image_mask = inputs["image_mask"]
@@ -1087,7 +1100,10 @@ def validate_settings(state, model_type, single_prompt, inputs):
             if video_guide is None:
                 gr.Info("You must provide a Control Video")
                 return ret()
-        if "A" in video_prompt_type and not "U" in video_prompt_type:             
+        if "+" in video_prompt_type and video_guide2 is None:
+            gr.Info("You must provide a second Control Video")
+            return ret()
+        if "A" in video_prompt_type and not "U" in video_prompt_type:
             if image_outputs:
                 if image_mask is None:
                     gr.Info("You must provide a Image Mask")
@@ -1122,15 +1138,17 @@ def validate_settings(state, model_type, single_prompt, inputs):
             return ret()
     else:
         video_guide = None
+        video_guide2 = None
         image_guide = None
         video_mask = None
         image_mask = None
         keep_frames_video_guide = ""
         denoising_strength = 1.0
         masking_strength = 1.0
-    
+
     if image_outputs:
         video_guide = None
+        video_guide2 = None
         video_mask = None
     else:
         image_guide = None
@@ -1238,6 +1256,7 @@ def validate_settings(state, model_type, single_prompt, inputs):
         "audio_guide6": audio_guide6,
         "audio_source": audio_source,
         "video_guide": video_guide,
+        "video_guide2": video_guide2,
         "image_guide": image_guide,
         "video_mask": video_mask,
         "image_mask": image_mask,
@@ -1270,8 +1289,8 @@ def validate_settings(state, model_type, single_prompt, inputs):
 
 
 def get_preview_images(inputs):
-    inputs_to_query = ["image_start", "video_source", "image_end",  "video_guide", "image_guide", "video_mask", "image_mask", "image_refs" ]
-    labels = ["Start Image", "Video Source", "End Image", "Video Guide", "Image Guide", "Video Mask", "Image Mask", "Image Reference"]
+    inputs_to_query = ["image_start", "video_source", "image_end",  "video_guide", "video_guide2", "image_guide", "video_mask", "image_mask", "image_refs" ]
+    labels = ["Start Image", "Video Source", "End Image", "Video Guide", "Video Guide 2", "Image Guide", "Video Mask", "Image Mask", "Image Reference"]
     start_image_data = None
     start_image_labels = []
     end_image_data = None
@@ -2059,7 +2078,7 @@ def update_generation_status(html_content):
     if(html_content):
         return gr.update(value=html_content)
 
-family_handlers = ["models.wan.wan_handler", "models.wan.ovi_handler", "models.wan.df_handler", "models.hyvideo.hunyuan_handler", "models.ltx_video.ltxv_handler", "models.ltx2.ltx2_handler", "models.ltx2.scenema_audio_handler", "models.ltx2.ltx_audio_tts_handler", "models.longcat.longcat_handler", "models.flux.flux_handler", "models.qwen.qwen_handler", "models.kandinsky5.kandinsky_handler",  "models.z_image.z_image_handler", "models.krea2.krea2_handler", "models.hidream.hidream_handler", "models.TTS.ace_step_handler", "models.TTS.chatterbox_handler", "models.TTS.qwen3_handler", "models.TTS.yue_handler", "models.TTS.heartmula_handler", "models.TTS.kugelaudio_handler", "models.TTS.index_tts2_handler"]
+family_handlers = ["models.wan.wan_handler", "models.wan.ovi_handler", "models.wan.df_handler", "models.hyvideo.hunyuan_handler", "models.ltx_video.ltxv_handler", "models.ltx2.ltx2_handler", "models.ltx2.scenema_audio_handler", "models.ltx2.ltx_audio_tts_handler", "models.longcat.longcat_handler", "models.minimax_h3.minimax_h3_handler", "models.flux.flux_handler", "models.qwen.qwen_handler", "models.kandinsky5.kandinsky_handler",  "models.z_image.z_image_handler", "models.krea2.krea2_handler", "models.hidream.hidream_handler", "models.TTS.ace_step_handler", "models.TTS.chatterbox_handler", "models.TTS.qwen3_handler", "models.TTS.yue_handler", "models.TTS.heartmula_handler", "models.TTS.kugelaudio_handler", "models.TTS.index_tts2_handler"]
 DEFAULT_LORA_ROOT = "loras"
 
 def register_family_lora_args(parser, lora_root):
@@ -2132,6 +2151,11 @@ def _parse_args():
         "--save-quantized",
         action="store_true",
         help="Save a quantized version of the current model"
+    )
+    parser.add_argument(
+        "--convrot",
+        action="store_true",
+        help="Save INT8 ConvRot instead of Quanto INT8 (requires --save-quantized)"
     )
     parser.add_argument(
         "--test",
@@ -3468,8 +3492,9 @@ def save_model(model, model_type, dtype,  config_file,  submodel_no = 1,  is_mod
         with open(finetune_file, "w", encoding="utf-8") as writer:
             writer.write(json.dumps(saved_finetune_def, indent=4))
 
-def save_quantized_model(model, model_type, model_filename, dtype,  config_file, submodel_no = 1):
-    if "quanto" in model_filename: return
+def save_quantized_model(model, model_type, model_filename, dtype,  config_file, submodel_no = 1, convrot_layout = None):
+    if "quanto" in model_filename or "convrot" in model_filename: return
+    source_filename = model_filename
     model_def = get_model_def(model_type)
     if model_def == None: return
     url_key = "URLs" if submodel_no <=1 else "URLs" + str(submodel_no)
@@ -3486,18 +3511,25 @@ def save_quantized_model(model, model_type, model_filename, dtype,  config_file,
 
     for rep in ["mfp16", "fp16", "mbf16", "bf16"]:
         if "_" + rep in model_filename:
-            model_filename = model_filename.replace("_" + rep, "_quanto_" + rep + "_int8")
+            replacement = "_int8_convrot" if args.convrot else f"_quanto_{rep}_int8"
+            model_filename = model_filename.replace("_" + rep, replacement)
             break
-    if not "quanto" in model_filename:
+    if not any(token in model_filename for token in ("quanto", "convrot")):
         pos = model_filename.rfind(".")
-        model_filename =  model_filename[:pos] + "_quanto_int8" + model_filename[pos:] 
+        suffix = "_int8_convrot" if args.convrot else "_quanto_int8"
+        model_filename = model_filename[:pos] + suffix + model_filename[pos:]
 
     model_filename = os.path.basename(model_filename)
     if fl.locate_file(model_filename, error_if_none= False) is not None:
         print(f"There isn't any model to quantize as quantized model '{model_filename}' aready exists")
     else:
         model_filename_path = os.path.join(fl.get_download_location(), model_filename)
-        offload.save_model(model, model_filename_path, do_quantize= True, config_file_path=config_file)
+        if args.convrot:
+            from shared.convert.convrot import save_convrot_model
+            source_path = source_filename if os.path.isfile(source_filename) else fl.locate_file(source_filename)
+            save_convrot_model(model, source_path, model_filename_path, layout=convrot_layout, verboseLevel=verbose_level)
+        else:
+            offload.save_model(model, model_filename_path, do_quantize= True, config_file_path=config_file)
         print(f"New quantized file '{model_filename}' had been created for finetune Id '{model_type}'.")
         if not model_filename in URLs:
             URLs.append(model_filename)
@@ -6883,10 +6915,11 @@ def generate_video(
     image_refs,
     frames_positions,
     video_guide,
+    video_guide2,
     image_guide,
     keep_frames_video_guide,
     denoising_strength,
-    masking_strength,     
+    masking_strength,
     video_guide_outpainting,
     video_mask,
     image_mask,
@@ -7318,7 +7351,9 @@ def generate_video(
     trans2 = get_transformer_model(wan_model, 2)
     audio_sampling_rate = 16000
 
-    if multi_prompts_gen_type == 2:
+    if multi_prompts_gen_type == 2 or model_def.get("single_block_prompt", False):
+        # See validate_settings: models with a structured multi-line prompt
+        # (MiniMax H3) must be handed the whole block as one prompt.
         prompts = [prompt]
     else:
         prompts = prompt.split("\n")
@@ -7396,8 +7431,11 @@ def generate_video(
     # negative_prompt = "" # not applicable in the inference
     model_filename = get_model_filename(base_model_type)  
 
-    _, _, latent_size = get_model_min_frames_and_step(model_type)
-    video_length = (video_length -1) // latent_size * latent_size + 1
+    frames_minimum, _, latent_size = get_model_min_frames_and_step(model_type)
+    # Most models pack frames as 1 + k*latent_size; frames_offset lets a model
+    # declare a different anchor (MiniMax H3 packs 5 + k*17).
+    frames_offset = model_def.get("frames_offset", 1)
+    video_length = floor_frame_count(video_length, frames_minimum, latent_size, frames_offset)
     published_video_length = video_length
     recast_warmup_frames = _resolve_scail2_recast_warmup_frames(
         custom_settings, model_def, video_prompt_type, latent_size,
@@ -7410,7 +7448,7 @@ def generate_video(
             f"({published_video_length} published, {video_length} generated)."
         )
     if sliding_window_size !=0:
-        sliding_window_size = (sliding_window_size -1) // latent_size * latent_size + 1
+        sliding_window_size = floor_frame_count(sliding_window_size, frames_minimum, latent_size, frames_offset)
     # Requantize audio_frame_offset to match the actual quantized video_length per clip.
     # Only recalculate for uniform-duration clips (multi_prompts_gen_type==3).
     # Clips dispatched from the manifest path (launch.py) already carry correct
@@ -7454,17 +7492,21 @@ def generate_video(
     if any_letters(audio_prompt_type, "R") and video_guide is not None and MMAudio_setting == 0 and not any_letters(audio_prompt_type, "ABXK"):
         control_audio_tracks, _  = extract_audio_tracks(video_guide, temp_format="wav")
     if "K" in audio_prompt_type and video_guide is not None:
-        try:
-            if extract_audio_tracks(video_guide, query_only=True) == 0:
-                print(f"No audio track found in Control Video: {video_guide}")
-                audio_guide = None
-            else:
-                audio_guide = extract_audio_track_to_wav(video_guide, get_available_filename(save_path, video_guide, suffix="_control_audio", force_extension=".wav"))
-                temp_filenames_list.append(audio_guide)
-        except Exception as e:
-            print(f"Unable to extract Audio track from Control Video:{e}")
-            audio_guide = None
-        audio_guide2 = None
+        # Each control video contributes its own soundtrack, so a model that
+        # accepts two of them (MiniMax H3 Ref2VA) gets two audio guides.
+        extracted_guides = [None, None]
+        for index, guide in enumerate((video_guide, video_guide2)):
+            if guide is None:
+                continue
+            try:
+                if extract_audio_tracks(guide, query_only=True) == 0:
+                    print(f"No audio track found in Control Video #{index + 1}: {guide}")
+                else:
+                    extracted_guides[index] = extract_audio_track_to_wav(guide, get_available_filename(save_path, guide, suffix=f"_control_audio{index + 1}", force_extension=".wav"))
+                    temp_filenames_list.append(extracted_guides[index])
+            except Exception as e:
+                print(f"Unable to extract Audio track from Control Video #{index + 1}: {e}")
+        audio_guide, audio_guide2 = extracted_guides
     if video_source is not None:
         source_audio_tracks, source_audio_metadata = extract_audio_tracks(video_source, temp_format="wav")
         video_fps, _, _, video_frames_count = get_video_info(video_source)
@@ -7639,7 +7681,7 @@ def generate_video(
         # the text prompt drives length and the model continues the
         # audio past the source end (LTX-2.3 supports this natively).
         if not video_length_not_limited_by_audio:
-            current_video_length = min(int(fps * duration //latent_size) * latent_size + latent_size + 1, current_video_length)
+            current_video_length = min(normalize_frame_count(int(fps * duration) + latent_size, frames_minimum, latent_size, frames_offset), current_video_length)
         if fantasy:
             from models.wan.fantasytalking.infer import parse_audio
             # audio_proj_split_full, audio_context_lens_full = parse_audio(audio_guide, num_frames= max_source_video_frames, fps= fps,  padded_frames_for_embeddings= (reuse_frames if reset_control_aligment else 0), device= processing_device  )
@@ -7861,7 +7903,7 @@ def generate_video(
                 # num_frames_generated -= reuse_frames
                 if (requested_frames_to_generate - num_frames_generated) <  latent_size:
                     break
-                current_video_length = min(sliding_window_size, ((requested_frames_to_generate - num_frames_generated + reuse_frames + discard_last_frames) // latent_size) * latent_size + 1 )
+                current_video_length = min(sliding_window_size, floor_frame_count(requested_frames_to_generate - num_frames_generated + reuse_frames + discard_last_frames, frames_minimum, latent_size, frames_offset))
 
             total_windows = initial_total_windows + extra_windows
             gen["total_windows"] = total_windows
@@ -8229,7 +8271,7 @@ def generate_video(
                                                                         None if dont_cat_preguide or fake_start_image and window_no==1 else pre_video_guide,
                                                                         image_size, current_video_length, latent_size,
                                                                         any_mask, any_guide_padding, guide_inpaint_color, 
-                                                                        keep_frames_parsed, frames_to_inject_parsed , outpainting_dims)
+                                                                        keep_frames_parsed, frames_to_inject_parsed , outpainting_dims, frame_offset=frames_offset)
                 video_guide_processed = video_guide_processed2 = video_mask_processed = video_mask_processed2 = None
                 if len(src_videos) == 1:
                     src_video, src_video2, src_mask, src_mask2 = src_videos[0], None, src_masks[0], None 
@@ -8240,7 +8282,7 @@ def generate_video(
                 if src_video is None or window_no >1 and src_video.shape[1] <= sliding_window_overlap and not dont_cat_preguide:
                     abort = True 
                     break
-                if model_def.get("control_video_trim", False) :
+                if model_def.get("control_video_trim", False) and not model_def.get("control_video_trim_disabled", False):
                     if src_video is None:
                         abort = True 
                         break
@@ -8353,10 +8395,12 @@ def generate_video(
                     input_video= input_video_for_model,
                     input_faces = src_faces,
                     input_custom = custom_guide,
+                    video_guide = video_guide,
+                    video_guide2 = video_guide2,
                     denoising_strength=denoising_strength,
                     masking_strength=masking_strength,
                     prefix_frames_count = prefix_frames_count,
-                    frame_num= (current_video_length // latent_size)* latent_size + 1,
+                    frame_num= floor_frame_count(current_video_length, frames_minimum, latent_size, frames_offset),
                     batch_size = batch_size,
                     height = image_size[0],
                     width = image_size[1],
@@ -10933,6 +10977,7 @@ def save_inputs(
             image_refs,
             frames_positions,
             video_guide,
+            video_guide2,
             image_guide,
             keep_frames_video_guide,
             denoising_strength,
@@ -11351,7 +11396,7 @@ def refresh_video_prompt_type_video_guide(state, filter_type, video_prompt_type,
             custom_options = True
             custom_checkbox = custom_video_selection.get("type","") == "checkbox"
     mask_strength_always_enabled = model_def.get("mask_strength_always_enabled", False)  
-    return video_prompt_type,  gr.update(visible = visible and not image_outputs), image_guide, gr.update(visible = keep_frames_video_guide_visible), gr.update(visible = visible and "G" in video_prompt_type),  gr.update(visible = mask_visible and( mask_strength_always_enabled or "G" in video_prompt_type)), gr.update(visible= (visible or injected_frames_positions_visible(video_prompt_type) or "K" in video_prompt_type) and any_outpainting), gr.update(visible= visible and mask_selector_visible and  not "U" in video_prompt_type ) ,  gr.update(visible= mask_visible and not image_outputs), image_mask, image_mask_guide, gr.update(visible= mask_visible),  gr.update(visible = ref_images_visible ), gr.update(visible = injected_frames_positions_visible(video_prompt_type)), gr.update(visible= custom_options and not custom_checkbox ), gr.update(visible= custom_options and custom_checkbox ), gr.update(visible = input_video_strength_visible(model_def, image_prompt_type, video_prompt_type)) 
+    return video_prompt_type,  gr.update(visible = visible and not image_outputs), gr.update(visible = "+" in video_prompt_type and not image_outputs), image_guide, gr.update(visible = keep_frames_video_guide_visible), gr.update(visible = visible and "G" in video_prompt_type),  gr.update(visible = mask_visible and( mask_strength_always_enabled or "G" in video_prompt_type)), gr.update(visible= (visible or injected_frames_positions_visible(video_prompt_type) or "K" in video_prompt_type) and any_outpainting), gr.update(visible= visible and mask_selector_visible and  not "U" in video_prompt_type ) ,  gr.update(visible= mask_visible and not image_outputs), image_mask, image_mask_guide, gr.update(visible= mask_visible),  gr.update(visible = ref_images_visible ), gr.update(visible = injected_frames_positions_visible(video_prompt_type)), gr.update(visible= custom_options and not custom_checkbox ), gr.update(visible= custom_options and custom_checkbox ), gr.update(visible = input_video_strength_visible(model_def, image_prompt_type, video_prompt_type)) 
 
 def refresh_video_prompt_type_video_custom_dropbox(state, video_prompt_type, video_prompt_type_video_custom_dropbox):
     model_type = get_state_model_type(state)
@@ -12125,7 +12170,10 @@ def generate_video_tab(update_form = False, state_dict = None, ui_defaults = Non
                         )
 
                 image_guide = gr.Image(label= "Control Image", height = 800, type ="pil", visible= image_mode_value==1 and "V" in video_prompt_type_value and ("U" in video_prompt_type_value or "A" not in video_prompt_type_value ) , value= ui_defaults.get("image_guide", None))
-                video_guide = gr.Video(label= "Control Video", height = gallery_height, visible= (not image_outputs) and "V" in video_prompt_type_value, value= ui_defaults.get("video_guide", None), elem_id="video_input")
+                video_guide = gr.Video(label= model_def.get("video_guide_label", "Control Video"), height = gallery_height, visible= (not image_outputs) and "V" in video_prompt_type_value, value= ui_defaults.get("video_guide", None), elem_id="video_input")
+                # Second guide video, for models that take two (MiniMax H3
+                # Ref2VA). Selected by "+" in video_prompt_type.
+                video_guide2 = gr.Video(label= model_def.get("video_guide2_label", "Control Video 2"), height = gallery_height, visible= (not image_outputs) and "+" in video_prompt_type_value, value= ui_defaults.get("video_guide2", None), elem_id="video_input2")
                 if image_mode_value >= 1:  
                     image_guide_value = ui_defaults.get("image_guide", None)
                     image_mask_value = ui_defaults.get("image_mask", None)
@@ -13154,8 +13202,8 @@ def generate_video_tab(update_form = False, state_dict = None, ui_defaults = Non
             image_prompt_type_radio.change(fn=refresh_image_prompt_type_radio, inputs=[state, image_prompt_type, image_prompt_type_radio, video_prompt_type], outputs=[image_prompt_type, image_start_row, image_end_row, video_source, input_video_strength, keep_frames_video_source, image_prompt_type_endcheckbox], show_progress="hidden" ) 
             image_prompt_type_endcheckbox.change(fn=refresh_image_prompt_type_endcheckbox, inputs=[state, image_prompt_type, image_prompt_type_radio, image_prompt_type_endcheckbox, video_prompt_type], outputs=[image_prompt_type, image_end_row, input_video_strength] ) 
             video_prompt_type_image_refs.input(fn=refresh_video_prompt_type_image_refs, inputs = [state, video_prompt_type, video_prompt_type_image_refs,image_mode, image_prompt_type], outputs = [video_prompt_type, image_refs_row, remove_background_images_ref,  image_refs_relative_size, frames_positions,video_guide_outpainting_col, input_video_strength], show_progress="hidden")
-            video_prompt_type_video_guide.input(fn=refresh_video_prompt_type_video_guide,     inputs = [state, gr.State(""),   video_prompt_type, video_prompt_type_video_guide,     image_mode, image_mask_guide, image_guide, image_mask, image_prompt_type], outputs = [video_prompt_type, video_guide, image_guide, keep_frames_video_guide, denoising_strength, masking_strength,  video_guide_outpainting_col, video_prompt_type_video_mask, video_mask, image_mask, image_mask_guide, mask_expand, image_refs_row, frames_positions, video_prompt_type_video_custom_dropbox, video_prompt_type_video_custom_checkbox, input_video_strength], show_progress="hidden") 
-            video_prompt_type_video_guide_alt.input(fn=refresh_video_prompt_type_video_guide, inputs = [state, gr.State("alt"),video_prompt_type, video_prompt_type_video_guide_alt, image_mode, image_mask_guide, image_guide, image_mask, image_prompt_type], outputs = [video_prompt_type, video_guide, image_guide, keep_frames_video_guide, denoising_strength, masking_strength, video_guide_outpainting_col, video_prompt_type_video_mask, video_mask, image_mask, image_mask_guide, mask_expand, image_refs_row, frames_positions, video_prompt_type_video_custom_dropbox, video_prompt_type_video_custom_checkbox, input_video_strength], show_progress="hidden") 
+            video_prompt_type_video_guide.input(fn=refresh_video_prompt_type_video_guide,     inputs = [state, gr.State(""),   video_prompt_type, video_prompt_type_video_guide,     image_mode, image_mask_guide, image_guide, image_mask, image_prompt_type], outputs = [video_prompt_type, video_guide, video_guide2, image_guide, keep_frames_video_guide, denoising_strength, masking_strength,  video_guide_outpainting_col, video_prompt_type_video_mask, video_mask, image_mask, image_mask_guide, mask_expand, image_refs_row, frames_positions, video_prompt_type_video_custom_dropbox, video_prompt_type_video_custom_checkbox, input_video_strength], show_progress="hidden") 
+            video_prompt_type_video_guide_alt.input(fn=refresh_video_prompt_type_video_guide, inputs = [state, gr.State("alt"),video_prompt_type, video_prompt_type_video_guide_alt, image_mode, image_mask_guide, image_guide, image_mask, image_prompt_type], outputs = [video_prompt_type, video_guide, video_guide2, image_guide, keep_frames_video_guide, denoising_strength, masking_strength, video_guide_outpainting_col, video_prompt_type_video_mask, video_mask, image_mask, image_mask_guide, mask_expand, image_refs_row, frames_positions, video_prompt_type_video_custom_dropbox, video_prompt_type_video_custom_checkbox, input_video_strength], show_progress="hidden") 
             # video_prompt_type_video_guide_alt.input(fn=refresh_video_prompt_type_video_guide_alt, inputs = [state, video_prompt_type, video_prompt_type_video_guide_alt, image_mode, image_mask_guide, image_guide, image_mask], outputs = [video_prompt_type, video_guide, image_guide, image_refs_row, denoising_strength, masking_strength, video_mask, mask_expand, image_mask_guide, image_guide, image_mask, keep_frames_video_guide ], show_progress="hidden")
             video_prompt_type_video_custom_dropbox.input(fn= refresh_video_prompt_type_video_custom_dropbox, inputs=[state, video_prompt_type, video_prompt_type_video_custom_dropbox], outputs = video_prompt_type)
             video_prompt_type_video_custom_checkbox.input(fn= refresh_video_prompt_type_video_custom_checkbox, inputs=[state, video_prompt_type, video_prompt_type_video_custom_checkbox], outputs = video_prompt_type)

@@ -88,6 +88,7 @@ if _hf_token_path:
 # Now safe to import wgp - all module-level code will run with patched argv
 print("[Maestro] Importing WanGP engine...")
 import wgp
+from shared.utils.frame_scheduler import floor_frame_count, normalize_frame_count
 print(f"[Maestro] WanGP loaded: {len(wgp.displayed_model_types)} models available")
 # Base save path always comes from server_config["save_path"] (never from wgp.save_path which gets workspace-modified)
 
@@ -5041,6 +5042,19 @@ def get_model_options(model_type: str):
         "t2v_class": md.get("t2v_class", False),
         "image_outputs": md.get("image_outputs", False),
         "supports_end_frame": "E" in md.get("image_prompt_types_allowed", ""),
+        # Raw letters so the UI can gate the Studio mode tabs: S=start frame,
+        # E=end frame, V=continue from a video source, T=text-only.
+        "image_prompt_types_allowed": md.get("image_prompt_types_allowed", ""),
+        "video_continuation": md.get("video_continuation", False),
+        "video_end_conditioning": md.get("video_end_conditioning", False),
+        # Tile labels for the Inputs row. Models whose guide video is
+        # reference material rather than a motion control track rename it
+        # (MiniMax H3 Ref2VA: "Reference Video 1"/"Reference Video 2").
+        "video_guide_label": md.get("video_guide_label"),
+        "video_guide2_label": md.get("video_guide2_label"),
+        # The prompt is one structured multi-line block (MiniMax H3), so the UI
+        # must not use bare newlines as clip separators for it.
+        "single_block_prompt": md.get("single_block_prompt", False),
 
         # Choice configs
         "guide_preprocessing": extract_choice("guide_preprocessing"),
@@ -5071,6 +5085,10 @@ def get_model_options(model_type: str):
         "fps": md.get("fps", 16),
         "frames_minimum": md.get("frames_minimum", 5),
         "frames_steps": md.get("frames_steps", 4),
+        # Anchor for the frame-count lattice: valid counts are
+        # frames_offset + k*frames_steps. Almost every model uses 1;
+        # MiniMax H3 packs 17 frames per latent anchored at 5.
+        "frames_offset": md.get("frames_offset", 1),
 
         # Model defaults (sent to frontend so UI can apply them on model selection)
         # Check model def first, then fall back to ui_defaults from the handler
@@ -7484,6 +7502,7 @@ async def plan_audio_structure(request: Request):
     fps = body.get("fps", 16)
     frames_steps = body.get("frames_steps", 4)
     frames_minimum = body.get("frames_minimum", 5)
+    frames_offset = body.get("frames_offset", 1)
     video_model = body.get("video_model")
     if video_model:
         try:
@@ -7492,6 +7511,7 @@ async def plan_audio_structure(request: Request):
                 fps = md["fps"]
             _minf, _fs, _lat = wgp.get_model_min_frames_and_step(video_model)
             frames_minimum, frames_steps = _minf, _fs
+            frames_offset = md.get("frames_offset", 1)
         except Exception:
             pass
 
@@ -7502,6 +7522,7 @@ async def plan_audio_structure(request: Request):
             fps=fps,
             frames_steps=frames_steps,
             frames_minimum=frames_minimum,
+            frames_offset=frames_offset,
             total_duration=body.get("total_duration"),
         )
         return {"clips": clips}
@@ -17434,17 +17455,27 @@ async def blend_endpoint(request: Request):
         info_a = _probe(clip_a_path)
         info_b = _probe(clip_b_path)
 
-        # ── Target geometry (A's native, aligned to 32 for LTX) ──────────
-        fps = info_a["fps"]
-        # LTX-2 frames schedule: must be >= 17 and (n - 17) % 8 == 0
-        raw_frames = max(17, int(round(overlap_sec * fps)))
-        transition_frames = 17 + 8 * math.ceil((raw_frames - 17) / 8) if raw_frames > 17 else 17
+        # ── Target geometry (A's native, aligned to the model's block) ────
+        # Blend generates at the TARGET model's frame lattice, not A's fps.
+        # LTX-2 wants >= 17 with (n - 17) % 8 == 0; MiniMax H3 wants >= 107
+        # with (n - 5) % 17 == 0. Read it from the model instead of
+        # hardcoding LTX-2's schedule, or the request lands off-lattice and
+        # the backend silently floors it (shortening the transition).
+        _blend_md = wgp.get_model_def(model_type) or {}
+        _blend_min, _blend_step, _blend_latent = wgp.get_model_min_frames_and_step(model_type)
+        _blend_offset = _blend_md.get("frames_offset", 1)
+        # H3 fixes its own output rate; using A's fps would request a
+        # duration the model cannot produce.
+        fps = float(_blend_md.get("fps") or 0) or info_a["fps"]
+        raw_frames = max(_blend_min, int(round(overlap_sec * fps)))
+        transition_frames = normalize_frame_count(raw_frames, _blend_min, _blend_latent or _blend_step, _blend_offset)
         # Effective overlap after rounding (for frame-accurate trim/concat)
         overlap_sec_eff = transition_frames / fps
 
-        # Snap resolution to LTX's 32-px alignment
-        src_w = (info_a["w"] // 32) * 32
-        src_h = (info_a["h"] // 32) * 32
+        # Snap resolution to the model's spatial block (32 for LTX-2 and H3)
+        _blend_block = int(_blend_md.get("block_size", 32) or 32)
+        src_w = (info_a["w"] // _blend_block) * _blend_block
+        src_h = (info_a["h"] // _blend_block) * _blend_block
         if src_w <= 0 or src_h <= 0:
             raise HTTPException(status_code=400, detail=f"Clip A resolution too small: {info_a['w']}x{info_a['h']}")
 
@@ -17545,7 +17576,11 @@ async def blend_endpoint(request: Request):
         # They are EXACTLY the frames of B's overlap zone that B_post was
         # going to skip anyway, so the blend → B_post seam stays frame-
         # perfect (blend[N-1] = B[O-1] → B_post[0] = B[O]).
-        motion_suffix_sec = float(body.get("motion_suffix_sec", 1.0))
+        # Only models that actually consume `input_video_end` get a motion
+        # suffix; for the rest (MiniMax H3) those frames would be charged
+        # against the transition budget and then silently ignored, so they
+        # keep the single end-image anchor instead.
+        motion_suffix_sec = float(body.get("motion_suffix_sec", 1.0)) if _blend_md.get("video_end_conditioning", False) else 0.0
         motion_suffix_sec = max(0.0, min(motion_suffix_sec, overlap_sec_eff * 0.8))
         K_suffix = int(round(motion_suffix_sec * fps)) if motion_suffix_sec > 0 else 0
         # Cap so suffix + prefix don't exceed transition length with no room
@@ -17569,7 +17604,10 @@ async def blend_endpoint(request: Request):
         #
         # Default 0 = pure SE (proven to produce great creative bridges).
         # Try 2-3 with injection_strength=0.3 to carry some motion context.
-        n_anchors = int(body.get("anchor_frames", 0))
+        # Injected keyframes ride in on image_refs, which only models with
+        # reference-image conditioning accept — MiniMax H3 FL2VA rejects
+        # image_refs outright, so anchors stay off for it.
+        n_anchors = int(body.get("anchor_frames", 0)) if _blend_md.get("image_ref_choices") else 0
         max_anchors = min(len(frames_a) - 1, len(frames_b) - 1, max(1, transition_frames // 4))
         n_anchors = max(0, min(n_anchors, max_anchors))
 
@@ -19914,8 +19952,10 @@ def _run_generation(job_id: str, *, finalize: bool = True) -> bool:
                 _mc_model_type = raw_params.get("model_type", "")
                 try:
                     _mc_min_f, _mc_fs, _mc_latent = wgp.get_model_min_frames_and_step(_mc_model_type)
+                    _mc_offset = (wgp.get_model_def(_mc_model_type) or {}).get("frames_offset", 1)
                 except Exception:
                     _mc_min_f, _mc_fs, _mc_latent = 17, 8, 8
+                    _mc_offset = 1
 
                 manifest = []
                 # Director timelines can begin after a silent intro. Preserve
@@ -19953,9 +19993,10 @@ def _run_generation(job_id: str, *, finalize: bool = True) -> bool:
                     if not has_start and i > 0:
                         clip_params["_continuation"] = True
                     clip_frames = per_clip_frames[i] if per_clip_frames and i < len(per_clip_frames) else sw_size
-                    # Quantize to valid frame count (same formula as wgp.py line 6280)
-                    clip_frames = (clip_frames - 1) // _mc_latent * _mc_latent + 1
-                    clip_frames = max(clip_frames, _mc_min_f)
+                    # Quantize to a valid frame count using the SAME lattice wgp
+                    # applies, so cumulative audio offsets stay in sync with the
+                    # frames actually produced.
+                    clip_frames = floor_frame_count(clip_frames, _mc_min_f, _mc_latent, _mc_offset)
                     # SE mode: mark tail frames for trimming (removes end-frame
                     # conditioning distortion at tensor level before saving)
                     trim_tail = 0
@@ -19975,9 +20016,12 @@ def _run_generation(job_id: str, *, finalize: bool = True) -> bool:
                         "audio_start_sec": multi_clip_audio_start_sec,
                     }
                     # If the clip prompt has newlines (window_prompts), use mode 1 (per-window)
-                    # Otherwise mode 0 (single task)
+                    # Otherwise mode 0 (single task). Models whose prompt is one
+                    # structured multi-line block (MiniMax H3) always take mode 0 —
+                    # their newlines separate FIELDS, not windows.
                     clip_prompt = clip_params.get("prompt", "")
-                    clip_params["multi_prompts_gen_type"] = 1 if "\n" in clip_prompt else 0
+                    _mc_single_block = bool((wgp.get_model_def(_mc_model_type) or {}).get("single_block_prompt", False))
+                    clip_params["multi_prompts_gen_type"] = 0 if _mc_single_block else (1 if "\n" in clip_prompt else 0)
                     # Keyframe injection: add image_refs and frames_positions for this clip
                     if per_clip_keyframes and i < len(per_clip_keyframes) and per_clip_keyframes[i]:
                         kf_paths = per_clip_keyframes[i]

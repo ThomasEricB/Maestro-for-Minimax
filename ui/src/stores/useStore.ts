@@ -4619,7 +4619,13 @@ export const useStore = create<AppState>((set, get) => ({
         promptLines = clips.map(c => c.prompt || '')
       }
 
-      params.prompt = promptLines.join('\n')
+      // Clips are normally separated by newlines. Models whose prompt is one
+      // structured multi-line block (MiniMax H3) would have their FIELDS read
+      // as clip boundaries, so those use the explicit boundary marker the
+      // backend already understands from the Director path.
+      params.prompt = state.modelOptions?.single_block_prompt
+        ? promptLines.join('\n---CLIP_BOUNDARY---\n')
+        : promptLines.join('\n')
       params.image_start = imagePaths
       if (hasAnyEndImage) {
         params.image_end = endImagePaths

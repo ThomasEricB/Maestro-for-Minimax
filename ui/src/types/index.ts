@@ -59,6 +59,9 @@ export interface GenerateParams {
   audio_guide?: string
   audio_scale?: number
   video_guide?: string
+  /** Second guide/reference video, for models that take two
+   *  (MiniMax H3 Ref2VA). Selected by "+" in video_prompt_type. */
+  video_guide2?: string
   image_refs?: string[]
   frames_positions?: string
   injection_strength?: number
@@ -246,6 +249,27 @@ export interface ModelOptions {
   fps: number
   frames_minimum: number
   frames_steps: number
+  /** Anchor of the model's frame lattice: valid counts are
+   *  frames_offset + k*frames_steps. 1 for nearly every model;
+   *  MiniMax H3 packs 17 frames per latent anchored at 5. */
+  frames_offset?: number
+  /** Model consumes `input_video_end` (a clip pinned to the end of the
+   *  latent sequence). Blend's motion-suffix path needs it. */
+  video_end_conditioning?: boolean
+  /** Model can continue an existing video (Extend mode). */
+  video_continuation?: boolean
+  /** image_prompt_type letters the model accepts (T/S/E/V/L). */
+  image_prompt_types_allowed?: string
+  /** Tile label for the guide video; set when it is reference material
+   *  rather than a motion control track. */
+  video_guide_label?: string | null
+  /** Tile label for the second guide video, when the model takes two. */
+  video_guide2_label?: string | null
+  /** Prompt is one structured multi-line block (MiniMax H3's
+   *  integrated_multimodal_description / overall_soundscape /
+   *  non_diegetic_music). Multi-Shot must not join clips with bare
+   *  newlines for these models. */
+  single_block_prompt?: boolean
   default_num_inference_steps: number | null
   default_guidance_scale: number | null
   hide_resolution_presets: boolean

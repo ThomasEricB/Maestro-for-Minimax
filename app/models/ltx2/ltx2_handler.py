@@ -158,6 +158,11 @@ class family_handler:
 
 
         extra_model_def = {
+            # This family consumes `input_video_end` (a short clip pinned to the
+            # END of the latent sequence). Blend's motion-suffix path checks
+            # this before spending transition frames on it; models without it
+            # fall back to a single end image.
+            "video_end_conditioning": True,
             "text_encoder_folder": _GEMMA_FOLDER,
             "text_encoder_URLs": [
                 build_hf_url("DeepBeepMeep/LTX-2", _GEMMA_FOLDER, _GEMMA_FILENAME),

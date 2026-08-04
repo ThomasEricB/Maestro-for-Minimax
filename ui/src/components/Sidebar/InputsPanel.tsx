@@ -117,6 +117,7 @@ export function InputsPanel() {
   const [injectedFrames, setInjectedFrames] = useState<InjectedFrame[]>([])
   const [frameUploading, setFrameUploading] = useState(false)
   const [videoGuideFilename, setVideoGuideFilename] = useState<string | null>(null)
+  const [videoGuide2Filename, setVideoGuide2Filename] = useState<string | null>(null)
   const [dragOverIndex, setDragOverIndex] = useState<number | null>(null)
   const [frameDragKey, setFrameDragKey] = useState<string | null>(null)
   const [frameDragOverKey, setFrameDragOverKey] = useState<string | null>(null)
@@ -144,6 +145,19 @@ export function InputsPanel() {
     return { fps, windowCount }
   }, [modelOptions, durationSeconds, slidingWindowSeconds, slidingWindowOverlap])
 
+  // ── Guide-video config (shared by the control- and reference-video tiles)
+  // Models like SCAIL-2 take a Control Video as the motion/scene guide
+  // (video_prompt_type contains 'V') with no audio coupling. Models with
+  // guide_preprocessing keep their upload in Advanced Settings, and
+  // K-audio models keep the soundtrack-coupled tile below.
+  const guideCfg = modelOptions?.guide_custom_choices as { choices?: [string, string][]; default?: string } | undefined
+  const guideDefault = guideCfg?.default || ''
+  const guideValues = guideCfg?.choices?.map(([, value]) => value) || []
+  const rawControlProcess = guideValues.find(value => value === 'VG' || value === 'V') || ''
+  // The two-video variant, e.g. H3 Ref2VA's "V+G" next to "VG".
+  const dualControlProcess = guideValues.find(value => typeof value === 'string' && value.includes('+')) || ''
+  const guideProcess = ((params.video_prompt_type as string) || guideDefault).replace(/T$/, '')
+
   // ── Audio / control-video capability + current state ───────────────
   const audioCfg = modelOptions?.audio_prompt_type_sources as
     { choices?: [string, string][]; selection?: string[]; default?: string } | undefined
@@ -162,18 +176,20 @@ export function InputsPanel() {
   const hasControlVid = supportsControlVid && !!params.video_guide
   const soundtrackName = audioGuideFilename || (params.audio_guide ? basename(params.audio_guide as string) : null)
   const controlVidName = videoGuideFilename || (params.video_guide ? basename(params.video_guide as string) : null)
+  // Reference-video models (MiniMax H3 Ref2VA) rename the guide tile and take
+  // a second clip. For them the video is content/appearance/motion reference,
+  // NOT a soundtrack source, so adding one must not auto-select "K" — that
+  // would fail validation on any reference clip with no audio track.
+  const controlVidLabel = modelOptions?.video_guide_label || 'Control video'
+  const controlVid2Label = modelOptions?.video_guide2_label || null
+  const isReferenceVideo = !!modelOptions?.video_guide_label
+  const supportsControlVid2 = !!controlVid2Label && !!dualControlProcess && !!params.video_guide
+  const hasControlVid2 = supportsControlVid2 && !!params.video_guide2
+  const controlVid2Name = videoGuide2Filename || (params.video_guide2 ? basename(params.video_guide2 as string) : null)
 
   // ── Guide video (motion source) for guide_custom_choices models ────
-  // Models like SCAIL-2 take a Control Video as the motion/scene guide
-  // (video_prompt_type contains 'V') with no audio coupling. Models with
-  // guide_preprocessing keep their upload in Advanced Settings, and
-  // K-audio models keep the soundtrack-coupled tile above — this tile
-  // only fills the gap between them.
-  const guideCfg = modelOptions?.guide_custom_choices as { choices?: [string, string][]; default?: string } | undefined
-  const guideDefault = guideCfg?.default || ''
-  const guideValues = guideCfg?.choices?.map(([, value]) => value) || []
-  const rawControlProcess = guideValues.find(value => value === 'VG' || value === 'V') || ''
-  const guideProcess = ((params.video_prompt_type as string) || guideDefault).replace(/T$/, '')
+  // This tile only fills the gap between guide_preprocessing models and
+  // K-audio models.
   const supportsGuideVid = !!guideCfg && !modelOptions?.guide_preprocessing && !supportsControlVid && guideProcess.includes('V')
   const hasGuideVid = supportsGuideVid && !!params.video_guide
 
@@ -352,7 +368,14 @@ export function InputsPanel() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [startImage, endImage, injectedFrames, params.image_start, params.image_end, isExtend, supportsEndFrame, lastWindow])
 
-  const canAddFrame = isExtend ? supportsInject : (!hasStart || (supportsEndFrame && !hasEnd) || supportsInject)
+  // Timeline-position frames need the model to accept "S". MiniMax H3 Ref2VA
+  // allows only "T" — its images are reference material (the Reference tiles
+  // below), not a first frame — and rejects image_start outright.
+  // Unknown (older backend) means "allowed", preserving previous behaviour.
+  const supportsStartFrame = (modelOptions?.image_prompt_types_allowed ?? 'S').includes('S')
+  const canAddFrame = isExtend
+    ? supportsInject
+    : ((supportsStartFrame && !hasStart) || (supportsEndFrame && !hasEnd) || supportsInject)
 
   // "+ Frame": smart default — 1st image = start, 2nd = end (where supported),
   // the rest injected keyframes that walk forward through the windows: in a
@@ -487,7 +510,9 @@ export function InputsPanel() {
       }
       // Source audio remains the default, with alternatives exposed in the
       // selected control tile instead of replacing the motion input.
-      setParam('audio_prompt_type', `K${audioFlags}`)
+      // Reference-video models are the exception: their clip is visual
+      // reference material, and "K" would demand it carry an audio track.
+      if (!isReferenceVideo) setParam('audio_prompt_type', `K${audioFlags}`)
     } catch (e) {
       console.error('Control video upload failed:', e)
     }
@@ -498,7 +523,30 @@ export function InputsPanel() {
     if (audioBase === 'K' || audioBase === '2') {
       setParam('audio_prompt_type', audioFlags)
     }
-    if (selected === 'ctrlvid') setSelected(null)
+    // A second reference video without a first is not a valid state.
+    if (params.video_guide2) {
+      setParam('video_guide2', undefined)
+      setVideoGuide2Filename(null)
+    }
+    if (rawControlProcess) setParam('video_prompt_type', rawControlProcess)
+    if (selected === 'ctrlvid' || selected === 'ctrlvid2') setSelected(null)
+  }
+  const handleAddControlVid2 = async (file: File) => {
+    try {
+      const result = await api.uploadImage(file)
+      setParam('video_guide2', result.path)
+      setVideoGuide2Filename(file.name)
+      // Switch the guide selection to its two-video variant ("VG" -> "V+G").
+      if (dualControlProcess) setParam('video_prompt_type', dualControlProcess)
+    } catch (e) {
+      console.error('Second reference video upload failed:', e)
+    }
+  }
+  const removeControlVid2 = () => {
+    setParam('video_guide2', undefined)
+    setVideoGuide2Filename(null)
+    if (rawControlProcess) setParam('video_prompt_type', rawControlProcess)
+    if (selected === 'ctrlvid2') setSelected(null)
   }
   const handleAddGuideVid = async (file: File) => {
     try {
@@ -593,13 +641,22 @@ export function InputsPanel() {
           <AddTile label="Soundtrack" icon={<Music size={18} />} onClick={() => pickFile('.wav,.mp3,.flac,.ogg,.m4a,.mp4,.mov,.mkv,.webm', handleAddSoundtrack)} onDropFile={handleAddSoundtrack} />
         )}
 
-        {/* Control video */}
+        {/* Control video (named "Reference Video 1" by reference-video models) */}
         {hasControlVid ? (
-          <Tile role="Control video" filledIcon={<Film size={20} />} filledLabel={controlVidName ?? undefined}
+          <Tile role={controlVidLabel} filledIcon={<Film size={20} />} filledLabel={controlVidName ?? undefined}
             imgSrc={null} selected={selected === 'ctrlvid'} onClear={removeControlVid}
             onSelect={() => setSelected(selected === 'ctrlvid' ? null : 'ctrlvid')} />
         ) : supportsControlVid && (
-          <AddTile label="Control video" icon={<Film size={18} />} onClick={() => pickFile('.mp4,.webm,.mkv,.mov', handleAddControlVid)} onDropFile={handleAddControlVid} dropAccept="video" />
+          <AddTile label={controlVidLabel} icon={<Film size={18} />} onClick={() => pickFile('.mp4,.webm,.mkv,.mov', handleAddControlVid)} onDropFile={handleAddControlVid} dropAccept="video" />
+        )}
+
+        {/* Second reference video — only offered once the first one is set. */}
+        {hasControlVid2 ? (
+          <Tile role={controlVid2Label ?? 'Reference Video 2'} filledIcon={<Film size={20} />} filledLabel={controlVid2Name ?? undefined}
+            imgSrc={null} selected={selected === 'ctrlvid2'} onClear={removeControlVid2}
+            onSelect={() => setSelected(selected === 'ctrlvid2' ? null : 'ctrlvid2')} />
+        ) : supportsControlVid2 && (
+          <AddTile label={controlVid2Label ?? 'Reference Video 2'} icon={<Film size={18} />} onClick={() => pickFile('.mp4,.webm,.mkv,.mov', handleAddControlVid2)} onDropFile={handleAddControlVid2} dropAccept="video" />
         )}
 
         {/* Guide video (motion source) — guide_custom_choices models (SCAIL-2 etc.) */}

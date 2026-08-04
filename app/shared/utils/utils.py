@@ -158,6 +158,25 @@ def process_images_multithread(image_processor, items, process_type, wrap_in_lis
     # print(f"duration:{end_time-start_time:.1f}")
 
     return results
+def get_resampled_video_transparent(video_in, start_frame, max_frames, target_fps, bridge='torch'):
+    """Decode a clip resampled to `target_fps`, passing still images through.
+
+    "Transparent" = the caller may hand this a video path, an image path, or
+    an already-loaded PIL image and get frames back either way; a still
+    yields a single frame. A negative `max_frames` counts back from the end
+    of the source (e.g. -1 = all frames but the last).
+    """
+    if isinstance(video_in, str) and has_image_file_extension(video_in):
+        video_in = Image.open(video_in)
+    if isinstance(video_in, Image.Image):
+        frame = torch.from_numpy(np.array(video_in).astype(np.uint8)).unsqueeze(0)
+        return frame if bridge == "torch" else frame.numpy()
+    metadata = probe_video_stream_metadata(video_in)
+    fps_float = metadata["fps_float"] if metadata is not None else 0.0
+    if max_frames < 0:
+        max_frames = int(max((metadata["frame_count"] / fps_float) * target_fps + max_frames, 0)) if metadata is not None and fps_float > 0 else 0
+    return decode_video_frames_ffmpeg(video_in, start_frame, max_frames, target_fps=target_fps, bridge=bridge)
+
 @lru_cache(maxsize=100)
 def get_video_info(video_path):
     # Prefer ffprobe metadata — returns DISPLAY dimensions (SAR-corrected) and
@@ -547,7 +566,7 @@ def fit_image_into_canvas(ref_img, image_size, canvas_tf_bg =127.5, device ="cpu
 
     return ref_img.to(device), canvas
 
-def prepare_video_guide_and_mask( video_guides, video_masks, pre_video_guide, image_size, current_video_length = 81, latent_size = 4, any_mask = False, any_guide_padding = False, guide_inpaint_color = 127.5, keep_video_guide_frames = [],  inject_frames = [], outpainting_dims = None, device ="cpu"):
+def prepare_video_guide_and_mask( video_guides, video_masks, pre_video_guide, image_size, current_video_length = 81, latent_size = 4, any_mask = False, any_guide_padding = False, guide_inpaint_color = 127.5, keep_video_guide_frames = [],  inject_frames = [], outpainting_dims = None, device ="cpu", frame_offset = 1):
     src_videos, src_masks = [], []
     inpaint_color_compressed = to_rgb_tensor(guide_inpaint_color, device=device, dtype=torch.float) / 127.5 - 1
     inpaint_color_compressed = inpaint_color_compressed.unsqueeze(1)
@@ -566,7 +585,7 @@ def prepare_video_guide_and_mask( video_guides, video_masks, pre_video_guide, im
                 pad = inpaint_color_compressed.to(src_video.device).expand(3, current_video_length - src_video.shape[1], *src_video.shape[-2:]).clone()
                 src_video = torch.cat([src_video, pad], dim=1)
         elif src_video is not None:
-            new_num_frames = (src_video.shape[1] - 1) // latent_size * latent_size + 1 
+            new_num_frames = src_video.shape[1] if src_video.shape[1] < frame_offset else (src_video.shape[1] - frame_offset) // latent_size * latent_size + frame_offset
             if new_num_frames < src_video.shape[1]:
                 print(f"invalid number of control frames {src_video.shape[1]}, potentially {src_video.shape[1]-new_num_frames} frames will be lost")
             src_video = src_video[:, :new_num_frames]

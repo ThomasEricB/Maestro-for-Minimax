@@ -837,20 +837,22 @@ def _snap_to_valid_frames(
     fps: int = 16,
     frames_steps: int = 4,
     frames_minimum: int = 5,
+    frames_offset: int = 1,
 ) -> int:
     """Convert a duration to the nearest valid frame count for WanGP.
 
-    WanGP normalises frame counts via: (n-1) // latent_size * latent_size + 1
-    so valid counts are 4n+1 = 5, 9, 13, 17, 21, ...
+    WanGP normalises frame counts to `frames_offset + k*frames_steps`.
+    Most models anchor at 1 (valid counts 5, 9, 13, 17, ... for step 4);
+    MiniMax H3 anchors at 5 with step 17 (107, 124, 141, ...).
     The result is clamped to at least *frames_minimum* (model-specific).
     """
+    from shared.utils.frame_scheduler import floor_frame_count, normalize_frame_count
+
     raw_frames = round(duration_seconds * fps)
-    snapped = ((raw_frames - 1) // frames_steps) * frames_steps + 1
+    snapped = floor_frame_count(raw_frames, frames_minimum, frames_steps, frames_offset)
     # Ensure we meet both the step-aligned minimum AND the model minimum
-    floor = max(frames_steps + 1, frames_minimum)
-    # If floor itself isn't step-aligned, round it up
-    if (floor - 1) % frames_steps != 0:
-        floor = ((floor - 1) // frames_steps + 1) * frames_steps + 1
+    floor = normalize_frame_count(max(frames_steps + frames_offset, frames_minimum),
+                                  frames_minimum, frames_steps, frames_offset)
     return max(floor, snapped)
 
 
@@ -902,6 +904,7 @@ def plan_clip_structure(
     fps: int = 16,
     frames_steps: int = 4,
     frames_minimum: int = 5,
+    frames_offset: int = 1,
     total_duration: Optional[float] = None,
 ) -> List[dict]:
     """Plan variable-duration clips aligned to beat positions.
@@ -1038,7 +1041,7 @@ def plan_clip_structure(
                     prev["end"] = clip_end
                     prev_dur = prev["end"] - prev["start"]
                     prev["beat_count"] = max(1, round(prev_dur / beat_duration))
-                    prev["duration_frames"] = _snap_to_valid_frames(prev_dur, fps, frames_steps, frames_minimum)
+                    prev["duration_frames"] = _snap_to_valid_frames(prev_dur, fps, frames_steps, frames_minimum, frames_offset)
                 continue
 
             actual_beats = max(1, round(clip_duration_s / beat_duration))
@@ -1064,7 +1067,7 @@ def plan_clip_structure(
                 "section_label": sec_label,
                 "energy": round(sec_energy, 3),
                 "suggested_prompt_hint": f"{sec_label}, {energy_desc}",
-                "duration_frames": _snap_to_valid_frames(clip_duration_s, fps, frames_steps, frames_minimum),
+                "duration_frames": _snap_to_valid_frames(clip_duration_s, fps, frames_steps, frames_minimum, frames_offset),
                 "dominant_speaker": clip_speaker,
             })
 
@@ -1077,7 +1080,7 @@ def plan_clip_structure(
             prev["end"] = last["end"]
             prev_dur = prev["end"] - prev["start"]
             prev["beat_count"] = max(1, round(prev_dur / beat_duration))
-            prev["duration_frames"] = _snap_to_valid_frames(prev_dur, fps, frames_steps, frames_minimum)
+            prev["duration_frames"] = _snap_to_valid_frames(prev_dur, fps, frames_steps, frames_minimum, frames_offset)
             clips.pop()
 
     return clips
@@ -1320,7 +1323,7 @@ def plan_dialogue_scenes(
                 prev = clips[-1]
                 prev["end"] = clip_end
                 prev_dur = prev["end"] - prev["start"]
-                prev["duration_frames"] = _snap_to_valid_frames(prev_dur, fps, frames_steps, frames_minimum)
+                prev["duration_frames"] = _snap_to_valid_frames(prev_dur, fps, frames_steps, frames_minimum, frames_offset)
             continue
 
         # Find dominant speaker in this clip
@@ -1355,7 +1358,7 @@ def plan_dialogue_scenes(
             "section_label": scene_label,
             "energy": 0.5,
             "suggested_prompt_hint": f"Scene {i + 1}: {scene_label}",
-            "duration_frames": _snap_to_valid_frames(clip_dur, fps, frames_steps, frames_minimum),
+            "duration_frames": _snap_to_valid_frames(clip_dur, fps, frames_steps, frames_minimum, frames_offset),
             "dominant_speaker": clip_speaker,
             "dialogue_lines": clip_dialogue,
         })
@@ -1368,7 +1371,7 @@ def plan_dialogue_scenes(
             prev = clips[-2]
             prev["end"] = last["end"]
             prev_dur = prev["end"] - prev["start"]
-            prev["duration_frames"] = _snap_to_valid_frames(prev_dur, fps, frames_steps, frames_minimum)
+            prev["duration_frames"] = _snap_to_valid_frames(prev_dur, fps, frames_steps, frames_minimum, frames_offset)
             prev["dialogue_lines"] = prev.get("dialogue_lines", []) + last.get("dialogue_lines", [])
             clips.pop()
 
@@ -1391,7 +1394,7 @@ def plan_dialogue_scenes(
                 "section_label": "scene",
                 "energy": 0.5,
                 "suggested_prompt_hint": f"Scene {i + 1}",
-                "duration_frames": _snap_to_valid_frames(c_end - c_start, fps, frames_steps, frames_minimum),
+                "duration_frames": _snap_to_valid_frames(c_end - c_start, fps, frames_steps, frames_minimum, frames_offset),
                 "dominant_speaker": None,
                 "dialogue_lines": [],
             })

@@ -12,6 +12,11 @@ export function DurationSlider() {
   const modelOptions = useStore(s => s.modelOptions)
 
   const fps = modelOptions?.fps ?? 16
+  // Shortest clip the model can actually produce. Asking for less doesn't
+  // fail — the backend clamps up to frames_minimum — but the slider would
+  // then promise a duration the output never has (MiniMax H3's floor is
+  // 107 frames at 24 fps, ~4.5s).
+  const minDuration = Math.max(1, Math.ceil((modelOptions?.frames_minimum ?? 5) / fps))
   const swDefaults = (modelOptions as Record<string, unknown> | null)?.sliding_window_defaults as Record<string, number> | undefined
   const discardFrames = swDefaults?.discard_last_frames ?? 0
   const overlapSeconds = Math.round((overlap / fps) * 10) / 10
@@ -44,6 +49,13 @@ export function DurationSlider() {
     }
   }, [duration, locked]) // eslint-disable-line react-hooks/exhaustive-deps
 
+  // Switching to a model with a longer floor (MiniMax H3) must lift a
+  // duration left over from the previous model, or the first generation
+  // silently runs longer than the slider says.
+  useEffect(() => {
+    if (duration < minDuration) setDuration(minDuration)
+  }, [minDuration]) // eslint-disable-line react-hooks/exhaustive-deps
+
   const imageMode = useStore(s => s.params.image_mode)
   const isMultiClip = imageMode === 2
   const promptLineCount = useStore(s => s.params.prompt.split('\n').filter((l: string) => l.trim()).length)
@@ -61,10 +73,10 @@ export function DurationSlider() {
       </div>
       <input
         type="range"
-        min={1}
+        min={minDuration}
         max={300}
         step={1}
-        value={duration}
+        value={Math.max(duration, minDuration)}
         onChange={e => setDuration(Number(e.target.value))}
       />
       {showSlidingWindow && !isMultiClip && (
