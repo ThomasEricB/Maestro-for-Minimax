@@ -53,6 +53,16 @@ HANDLER_PRIORITY = 1
 
 _NVFP4_LAYOUT_LEGACY = "legacy"
 _NVFP4_LAYOUT_TENSORCORE = "tensorcore"
+# Comfy-Org NVFP4 checkpoints, tagged per layer with a `comfy_quant` blob.
+# Same tensor set as "tensorcore", but the weight scales are stored PLAIN —
+# [out_features, in_features // 16] — with nibbles in natural order. ComfyUI,
+# which reads these files correctly, has no swizzle handling at all and marks
+# them {"format": "nvfp4", "full_precision_matrix_mult": true}, i.e. it also
+# dequantizes rather than using a kernel.
+_NVFP4_LAYOUT_COMFY = "comfy"
+# Layouts sharing tensorcore's TENSOR SET (weight_scale_2 + input_scale) and
+# its alpha-only output scaling, regardless of how scales are packed.
+_NVFP4_TENSORCORE_LIKE = (_NVFP4_LAYOUT_TENSORCORE, _NVFP4_LAYOUT_COMFY)
 
 _NVFP4_BACKEND_AUTO = "auto"
 _NVFP4_BACKEND_COMFY = "comfy"
@@ -291,6 +301,8 @@ def _nvfp4_can_use_kernel(input, weight):
     if backend is None:
         return False
     layout = _nvfp4_layout(weight)
+    if layout == _NVFP4_LAYOUT_COMFY:
+        return False
     if backend == _NVFP4_BACKEND_LIGHTX2V:
         if input.shape[-1] % 32 != 0:
             return False
@@ -575,13 +587,20 @@ def _dequantize_nvfp4_weight(
 
     m, k_bytes = weight_u8.shape
     byte_lut = _get_fp4_byte_lut(device, dtype)
+    # Comfy-Org files store scales plain and nibbles in natural order; the
+    # nibble swap and deswizzle below apply only to the swizzled layout.
+    plain_scales = layout == _NVFP4_LAYOUT_COMFY
     if layout == _NVFP4_LAYOUT_TENSORCORE:
         idx = _nvfp4_swap_nibbles(weight_u8).to(torch.int32)
     else:
         idx = weight_u8.to(torch.int32)
     out = byte_lut[idx].reshape(m, k_bytes * 2)
 
-    scale = _deswizzle_nvfp4_scale(scale, out.shape[1], block_size=block_size, dtype=dtype)
+    if not plain_scales:
+        scale = _deswizzle_nvfp4_scale(scale, out.shape[1], block_size=block_size, dtype=dtype)
+    else:
+        k_groups = out.shape[1] // block_size
+        scale = scale[:, :k_groups].to(dtype) if dtype is not None else scale[:, :k_groups]
     if scale.shape[0] < out.shape[0]:
         raise RuntimeError(
             f"NVFP4 scale row mismatch: expected at least {out.shape[0]} rows, got {scale.shape[0]}"
@@ -831,7 +850,7 @@ class NVFP4WeightTensor(QTensor):
         )
 
     def get_quantized_subtensors(self):
-        if self._layout == _NVFP4_LAYOUT_TENSORCORE:
+        if self._layout in _NVFP4_TENSORCORE_LIKE:
             return [
                 ("weight_u8", self._data),
                 ("weight_scale", self._scale),
@@ -1077,6 +1096,9 @@ class QLinearNVFP4(QModuleMixin, torch.nn.Linear):
         input_scale_key = prefix + "input_scale"
         output_scale_key = prefix + "output_scale"
         pre_quant_scale_key = prefix + "pre_quant_scale"
+        # Comfy-Org tags every quantized layer with `comfy_quant`; those files
+        # store scales plain and must not be deswizzled.
+        comfy_format = (prefix + "comfy_quant") in state_dict
 
         weight_u8 = state_dict.pop(weight_key, None)
         weight_scale = state_dict.pop(scale_key, None)
@@ -1119,7 +1141,9 @@ class QLinearNVFP4(QModuleMixin, torch.nn.Linear):
                         missing_keys.append(alpha_key)
 
         target_dtype = self._nvfp4_default_dtype or self.weight.dtype
-        if layout == _NVFP4_LAYOUT_TENSORCORE:
+        if comfy_format and layout == _NVFP4_LAYOUT_TENSORCORE:
+            layout = _NVFP4_LAYOUT_COMFY
+        if layout in _NVFP4_TENSORCORE_LIKE:
             if weight_u8 is not None and weight_scale is not None and weight_scale_2 is not None and input_scale is not None:
                 nvfp4_weight = NVFP4WeightTensor.create(
                     weight_u8=weight_u8,
