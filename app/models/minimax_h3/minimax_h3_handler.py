@@ -131,6 +131,12 @@ class family_handler:
             # one H3 prompt into three unrelated clips.
             "single_block_prompt": True,
             "preserve_empty_prompt_lines": True,
+            # H3 recognises well-known characters by name, so the prompt
+            # enhancer must keep names rather than replacing them with generic
+            # descriptors. Suppresses the shared video appendix, whose
+            # "never by identity" rule is appended last and would otherwise
+            # win; the H3 guides carry their own pacing rules in its place.
+            "recognizes_named_characters": True,
             "returns_audio": True,
             "multimedia_generation": True,
             "control_video_trim_disabled": True,

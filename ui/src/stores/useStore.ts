@@ -3257,8 +3257,23 @@ export const useStore = create<AppState>((set, get) => ({
 
   durationSeconds: 5,
   setDurationSeconds: (s) => {
-    const fps = get().modelOptions?.fps ?? 16
-    const frames = Math.round(s * fps)
+    const o = get().modelOptions
+    const fps = o?.fps ?? 16
+    // Snap to the model's frame lattice (frames_offset + k*frames_steps).
+    // The backend floors whatever it receives, so an unaligned request loses
+    // time silently: MiniMax H3 packs 5 + k*17 at 24fps, so a 5s request
+    // (120 frames) floored to 107 = 4.46s. Round to the NEAREST valid count
+    // instead, giving 124 = 5.17s — the closest length the model can produce.
+    const step = o?.frames_steps ?? 1
+    const offset = o?.frames_offset ?? 1
+    const minimum = o?.frames_minimum ?? 1
+    let frames = Math.round(s * fps)
+    if (step > 1) {
+      const k = Math.round((Math.max(frames, minimum) - offset) / step)
+      frames = Math.max(minimum, offset + Math.max(0, k) * step)
+    } else {
+      frames = Math.max(minimum, frames)
+    }
     set(state => ({
       durationSeconds: s,
       params: { ...state.params, video_length: frames },
@@ -5394,9 +5409,21 @@ export const useStore = create<AppState>((set, get) => ({
       const swDefaults = (options as unknown as Record<string, unknown>).sliding_window_defaults as Record<string, number> | undefined
       const overlapDefault = swDefaults?.overlap_default ?? 5
       const discardDefault = swDefaults?.discard_last_frames ?? 0
+      // Same lattice snap as setDurationSeconds — this runs on every model
+      // switch and would otherwise overwrite the snapped value with an
+      // unaligned one the backend then floors.
+      const _snapFrames = (seconds: number) => {
+        const step = options.frames_steps ?? 1
+        const offset = options.frames_offset ?? 1
+        const minimum = options.frames_minimum ?? 1
+        const raw = Math.round(seconds * fps)
+        if (step <= 1) return Math.max(minimum, raw)
+        const k = Math.round((Math.max(raw, minimum) - offset) / step)
+        return Math.max(minimum, offset + Math.max(0, k) * step)
+      }
       const paramUpdates: Record<string, unknown> = {
         guidance_phases: options.guidance_max_phases,
-        video_length: Math.round(durationSeconds * fps),
+        video_length: _snapFrames(durationSeconds),
         sliding_window_size: Math.round(slidingWindowSeconds * fps),
         sliding_window_overlap: overlapDefault,
         sliding_window_discard_last_frames: discardDefault,
@@ -5407,6 +5434,12 @@ export const useStore = create<AppState>((set, get) => ({
       }
       if (options.default_guidance_scale != null) {
         paramUpdates.guidance_scale = options.default_guidance_scale
+      }
+      // Flow shift is model-specific and was never applied on model switch, so
+      // it carried over from whichever model was selected before. MiniMax H3
+      // needs 12.0 and inherited 3, which corrupts its sampling schedule.
+      if (options.default_flow_shift != null) {
+        paramUpdates.flow_shift = options.default_flow_shift
       }
       // TTS default duration. Prefer the model's declared `default` (DramaBox
       // uses 0 = auto-derive from prompt); fall back to `max` (legacy behavior

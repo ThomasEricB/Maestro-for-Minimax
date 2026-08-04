@@ -6845,6 +6845,23 @@ def custom_preprocess_video_with_mask(model_handler, base_model_type, pre_video_
 def _video_tensor_to_uint8_chunk_inplace(sample, value_range=(-1, 1)):
     if sample.dtype == torch.uint8:
         return sample
+    # Models whose generate() runs under torch.inference_mode() hand back
+    # "inference tensors", which PyTorch refuses to mutate in place once that
+    # scope has been left:
+    #
+    #   RuntimeError: Inplace update to inference tensor outside InferenceMode
+    #   is not allowed.
+    #
+    # This conversion is a Maestro-specific memory optimisation (upstream WanGP
+    # has no in-place uint8 path), so the models cannot be expected to guard
+    # against it — MiniMax H3 returns its decoded video straight out of
+    # inference mode. Take one copy here, and only for such tensors, so every
+    # other model keeps the zero-copy path. Cloning must happen inside
+    # inference_mode(False): a clone taken while still inside inference mode
+    # inherits the flag.
+    if torch.is_inference(sample):
+        with torch.inference_mode(False):
+            sample = sample.clone()
     min_val, max_val = value_range
     sample = sample.clamp_(min_val, max_val)
     sample = sample.sub_(min_val).mul_(255.0 / (max_val - min_val)).to(torch.uint8)
@@ -7114,7 +7131,20 @@ def generate_video(
     
     base_model_type = get_base_model_type(model_type)
     model_handler = get_model_handler(base_model_type)
-    block_size = model_handler.get_vae_block_size(base_model_type) if hasattr(model_handler, "get_vae_block_size") else 16
+    # Pixel alignment every generated dimension is snapped to. Handlers that
+    # define get_vae_block_size() still win, but fall back to the model_def key
+    # before the generic 16 — upstream WanGP 12.x dropped the method entirely
+    # and reads model_def["vae_block_size"], so newer handlers only declare the
+    # key and were silently getting 16 here.
+    #
+    # That mattered: MiniMax H3 needs 32 (its VAE compresses 16x and the
+    # transformer then packs 2x2 latent patches), and at 16 a 720-high request
+    # stayed 720, producing a 45-row latent that patchify_video cannot reshape.
+    # models/hidream declares 32 and was affected the same way.
+    if hasattr(model_handler, "get_vae_block_size"):
+        block_size = model_handler.get_vae_block_size(base_model_type)
+    else:
+        block_size = model_def.get("vae_block_size", 16)
 
     if "P" in preload_model_policy and not "U" in preload_model_policy:
         while wan_model == None:

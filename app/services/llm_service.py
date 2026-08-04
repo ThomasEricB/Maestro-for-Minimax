@@ -2395,7 +2395,19 @@ def enhance_prompt(
     # who anyone is). Appended for video so EVERY path gets it: per-model guides
     # (Sulphur, 10Eros) that don't include the generic LTX video guide, plus the
     # generic guide itself. Mirrors the Director-mode character-reference rule.
-    if mode in ("video", "avatar"):
+    # Skipped for models that recognise characters by name (MiniMax H3). This
+    # block is appended LAST and its "do not leave a personal name in the
+    # output" rule would override the model guide, stripping exactly the names
+    # such a model can act on. Those guides carry their own pacing rules, so
+    # nothing else is lost.
+    _keeps_names = False
+    if model_type:
+        try:
+            from wgp import get_model_def as _get_model_def
+            _keeps_names = bool((_get_model_def(model_type) or {}).get("recognizes_named_characters", False))
+        except Exception:
+            _keeps_names = False
+    if mode in ("video", "avatar") and not _keeps_names:
         from services.guide_loader import load_guide as _load_vid_guide
         vid_block = _load_vid_guide("enhance", "video_shared")
         if vid_block:

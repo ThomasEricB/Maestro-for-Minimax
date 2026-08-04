@@ -11,7 +11,6 @@
 //                           Settings -> System -> Attention Mode.
 //   flash-attn 2.8.3        exact cu130+torch2.13+cp310 build
 //   xformers 0.0.35         compiled against this torch (see below)
-//   torchao 0.18.0          abi3, genuinely cross-version
 //   torchcodec 0.15.0       0.10.0 from requirements.txt is ABI-broken on
 //                           torch 2.13 ("undefined symbol: c10::MessageLogger")
 //                           and would silently kill video decoding
@@ -115,8 +114,10 @@ module.exports = {
         message: [
           "uv pip install torch==2.13.0+cu130 torchvision==0.28.0+cu130 torchaudio==2.11.0+cu130 --index-url https://download.pytorch.org/whl/cu130 --force-reinstall",
           "uv pip install https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.9.47/flash_attn-2.8.3%2Bcu130torch2.13-cp310-cp310-linux_x86_64.whl",
-          "uv pip install torchao==0.18.0",
           "uv pip install --force-reinstall --no-deps torchcodec==0.15.0",
+          // torch's install drags a newer numpy; requirements.txt needs 2.1.2.
+          // torch.js re-pins it the same way as its last step on Linux.
+          "uv pip install numpy==2.1.2",
           "uv pip install ninja"
         ]
       }
@@ -191,16 +192,6 @@ module.exports = {
         message: "python scripts/install_gguf_kernels.py"
       }
     },
-    // insightface caches its detection models INSIDE the venv, so carry them
-    // over rather than making the user re-download after the swap.
-    {
-      when: "{{exists('app/env/insightface')}}",
-      method: "fs.copy",
-      params: {
-        src: "app/env/insightface",
-        dest: "app/env_blackwell/insightface"
-      }
-    },
     // ---- Verify BEFORE touching the working venv -------------------------
     {
       method: "shell.run",
@@ -210,7 +201,6 @@ module.exports = {
         message: [
           "python -c \"import torch;assert torch.version.cuda.split('.')[0]=='13', f'expected cu13x, got {torch.version.cuda}';print('torch',torch.__version__,'cuda',torch.version.cuda,'cap',torch.cuda.get_device_capability())\"",
           "python -c \"import torchcodec;from torchcodec.decoders import VideoDecoder;print('torchcodec OK',torchcodec.__version__)\"",
-          "python -c \"import torchao;print('torchao OK',torchao.__version__)\"",
           "python -c \"import torch,flash_attn;L,H,D=1024,8,128;q,k,v=(torch.randn(L,H,D,dtype=torch.bfloat16,device='cuda') for _ in range(3));cu=torch.tensor([0,L],dtype=torch.int32,device='cuda');x=flash_attn.flash_attn_varlen_func(q=q,k=k,v=v,cu_seqlens_q=cu,cu_seqlens_k=cu,max_seqlen_q=L,max_seqlen_k=L,causal=False);torch.cuda.synchronize();r=torch.nn.functional.scaled_dot_product_attention(q.unsqueeze(0).transpose(1,2),k.unsqueeze(0).transpose(1,2),v.unsqueeze(0).transpose(1,2)).transpose(1,2).reshape(L,H,D);d=(x.float()-r.float()).abs().max().item();assert d<0.05, f'flash-attn diverges from sdpa: {d}';print(f'flash-attn {flash_attn.__version__} OK (max diff {d:.5f})')\"",
           // A CPU-only xformers imports fine and only fails once a generation
           // runs, so check the kernel rather than trusting the import.
@@ -228,6 +218,11 @@ module.exports = {
       params: {
         path: "app",
         message: [
+          // insightface caches its detection models INSIDE the venv; carry them
+          // across so they don't re-download. Done here with cp rather than the
+          // fs.copy API, which copied the folder but never returned control,
+          // stalling the script one step short of the swap.
+          "cp -r env/insightface env_blackwell/insightface 2>/dev/null || true",
           "rm -rf env",
           "mv env_blackwell env"
         ]
@@ -246,7 +241,7 @@ module.exports = {
       method: "fs.write",
       params: {
         path: "app/env/.maestro_blackwell_v1.installed",
-        text: "torch 2.13.0+cu130 + SageAttention 3 + flash-attn 2.8.3 + xformers 0.0.35 + torchao 0.18.0 + torchcodec 0.15.0, built by blackwell.js."
+        text: "torch 2.13.0+cu130 + SageAttention 3 + flash-attn 2.8.3 + xformers 0.0.35 + torchcodec 0.15.0, built by blackwell.js."
       }
     },
     {
