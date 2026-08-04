@@ -1712,6 +1712,12 @@ def _ensure_llama_server(bin_dir: str, device: str = "cpu") -> None:
             f"Downloaded llama.cpp release but {exe_name} not found in {bin_dir} "
             f"after extraction. Tried: {asset_urls}"
         )
+    # Runs on every call, not just after a download: installs extracted before
+    # the symlink fix above are already on disk missing their SONAMEs, and the
+    # download is skipped once the binary exists — so they would stay broken
+    # forever without a repair pass here. Idempotent and cheap. Must precede
+    # the receipt below, which runs llama-server --version to read the build.
+    _repair_soname_links(bin_dir)
     if needs_executable:
         installed_build = _llama_server_build(exe_path) or _llama_release_build(tag)
         _write_llama_runtime_receipt(
@@ -1720,6 +1726,51 @@ def _ensure_llama_server(bin_dir: str, device: str = "cpu") -> None:
             build=installed_build,
         )
     print(f"[LLM] llama-server installed to {exe_path}")
+
+
+_SOVERSION_RE = _re.compile(r"^(?P<base>.+\.so)\.(?P<version>\d+(?:\.\d+)*)$")
+
+
+def _repair_soname_links(bin_dir: str) -> None:
+    """Recreate missing `libfoo.so.N` links next to `libfoo.so.N.M.P`.
+
+    The loader resolves the SONAME recorded in the binary (e.g.
+    `libllama-common.so.0`), not the fully versioned filename, so without these
+    llama-server exits 127 before printing anything useful.
+    """
+    import shutil
+
+    try:
+        entries = os.listdir(bin_dir)
+    except OSError:
+        return
+    created = []
+    for filename in entries:
+        match = _SOVERSION_RE.match(filename)
+        if match is None or not os.path.isfile(os.path.join(bin_dir, filename)):
+            continue
+        base = match.group("base")
+        parts = match.group("version").split(".")
+        # libfoo.so.0.0.10252 -> libfoo.so.0.0, libfoo.so.0, libfoo.so
+        for count in range(len(parts) - 1, -1, -1):
+            suffix = ".".join(parts[:count])
+            link_path = os.path.join(bin_dir, f"{base}.{suffix}" if suffix else base)
+            if os.path.lexists(link_path):
+                continue
+            try:
+                os.symlink(filename, link_path)
+                created.append(os.path.basename(link_path))
+            except (OSError, NotImplementedError):
+                # Windows without developer mode: copy instead. Costs disk but
+                # keeps the loader happy.
+                try:
+                    shutil.copyfile(os.path.join(bin_dir, filename), link_path)
+                    created.append(os.path.basename(link_path))
+                except OSError:
+                    pass
+    if created:
+        print(f"[LLM] Restored {len(created)} missing shared-library links: {', '.join(sorted(created)[:6])}"
+              + (" ..." if len(created) > 6 else ""))
 
 
 def _get_server_exe(device: str = "cpu") -> str:
