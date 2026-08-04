@@ -95,6 +95,13 @@ app/plugins/wan2gp-gallery/
 app/plugins/wan2gp-lora-manager/
 app/plugins/wan2gp-lora-multipliers-ui/
 
+# Optional Blackwell acceleration (cuda13.js / sage3.js): a private CUDA 13
+# toolkit, the SageAttention source checkout it compiles, and the marker file
+# the menu reads. All generated at install time, never tracked.
+cuda13-toolkit/
+SageAttention/
+xformers_src/
+
 # Python bytecode (anywhere)
 __pycache__/
 app/wgp_config.json.bak

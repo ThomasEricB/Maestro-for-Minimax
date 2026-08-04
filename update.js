@@ -62,6 +62,22 @@ module.exports = {
       message: "uv pip install -r requirements.txt"
     }
   }, {
+    // Re-apply the Blackwell pins that requirements.txt just walked over.
+    // requirements.txt pins torchcodec==0.10.0, which is ABI-broken against
+    // torch 2.13 ("undefined symbol: c10::MessageLogger") and would leave
+    // video decoding silently dead after a routine Update. Only runs on a
+    // venv built by blackwell.js.
+    when: "{{exists('app/env/.maestro_blackwell_v1.installed')}}",
+    method: "shell.run",
+    params: {
+      venv: "env",
+      path: "app",
+      message: [
+        "uv pip install --force-reinstall --no-deps torchcodec==0.15.0",
+        "python -c \"import torch,torchcodec;from torchcodec.decoders import VideoDecoder;assert torch.version.cuda.split('.')[0]=='13';print('Blackwell venv intact:',torch.__version__,torchcodec.__version__)\""
+      ]
+    }
+  }, {
     // Skip torch.js when the marker file written by torch.js's last
     // successful run is still present — `torch + triton + sage + flash`
     // are already installed at the versions torch.js wants to install.

@@ -15,7 +15,14 @@ module.exports = {
       start: info.running("start.js"),
       start_classic: info.running("start_classic.js"),
       update: info.running("update.js"),
-      reset: info.running("reset.js")
+      reset: info.running("reset.js"),
+      blackwell: info.running("blackwell.js")
+    }
+    // Optional: swap the venv for a CUDA 13 + SageAttention 3 build. Opt-in,
+    // RTX 50-series only, and it replaces app/env rather than adding a second
+    // venv — on Blackwell the default cu128 stack is strictly worse.
+    let has = {
+      blackwell: info.exists("app/env/.maestro_blackwell_v1.installed")
     }
     if (running.install) {
       return [{
@@ -83,6 +90,13 @@ module.exports = {
           text: "Resetting",
           href: "reset.js",
         }]
+      } else if (running.blackwell) {
+        return [{
+          default: true,
+          icon: 'fa-solid fa-terminal',
+          text: "Building Blackwell venv",
+          href: "blackwell.js",
+        }]
       } else {
         return [{
           icon: "fa-solid fa-power-off",
@@ -141,6 +155,19 @@ module.exports = {
             ? "Update Inpaint Support (SAM 3.1)"
             : "Install Inpaint Support (SAM 3.1)",
           href: "sam_install.js",
+        }, {
+          // One-shot venv swap: CUDA 13 + SageAttention 3 + flash-attn +
+          // xformers + torchao. RTX 50-series (Linux) only; it REPLACES
+          // app/env rather than adding a second venv.
+          icon: "fa-solid fa-bolt",
+          text: has.blackwell
+            ? "[Linux] Blackwell Turbo Install (active)"
+            : "[Linux] Blackwell Turbo Install",
+          href: "blackwell.js",
+          mode: "refresh",
+          confirm: has.blackwell
+            ? "Rebuild the Blackwell venv from scratch (CUDA 13 + SageAttention 3 + flash-attn + xformers). ~20-30 minutes of compiling."
+            : "REPLACES Maestro's venv with a CUDA 13.0 build carrying SageAttention 3 (2.4-3.3x on long sequences), flash-attn 2.8.3, xformers, and torchao. SageAttention 2 is dropped — no CUDA 13 wheel exists — and sage3 replaces it. ~10GB download plus 20-30 minutes of compiling. The new venv is fully verified before your current one is removed, and Reset + Install always returns you to the default stack. RTX 50-series + Linux only."
         }, {
           icon: "fa-regular fa-circle-xmark",
           text: "<div><strong>Reset</strong><div>Revert to pre-install state</div></div>",

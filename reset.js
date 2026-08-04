@@ -10,6 +10,15 @@ module.exports = {
     { method: "fs.rm", params: { path: "app/services/sam/sam3" } },
     // UI build artifacts
     { method: "fs.rm", params: { path: "ui/node_modules" } },
-    { method: "fs.rm", params: { path: "ui/dist" } }
+    { method: "fs.rm", params: { path: "ui/dist" } },
+    // Blackwell venv build artifacts (blackwell.js): the private CUDA 13
+    // toolkit and the two source checkouts it compiles. The venv itself went
+    // with app/env above, which also takes its .maestro_blackwell marker — so
+    // the next Install returns to the default cu128 stack.
+    { method: "fs.rm", params: { path: "cuda13-toolkit" } },
+    { method: "fs.rm", params: { path: "SageAttention" } },
+    { method: "fs.rm", params: { path: "xformers_src" } },
+    // A build that failed before the swap leaves this behind.
+    { method: "fs.rm", params: { path: "app/env_blackwell" } }
   ]
 }
