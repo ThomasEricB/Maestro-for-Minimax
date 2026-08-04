@@ -63,6 +63,42 @@ _TRANSFORMER_WORKING_VRAM_MB = 16 * 1024
 # generic preset aiming at the same scale as native and falling short.
 _NATIVE_LIFT_FLOOR = 672
 
+# H3's own pipeline signature asks for 30 steps, and on a model that runs without CFG the step count is
+# most of what separates a soft render from a sharp one. But steps cost time linearly, and H3 is already
+# slow on a card that has to stream most of a 21 GB transformer, so a machine that would feel 30 as a
+# penalty gets the cheaper default instead. Whoever wants the other one can move the slider.
+_STEPS_SHARP = 30
+_STEPS_FAST = 20
+_SHARP_STEPS_MIN_VRAM_GB = 24
+
+
+def _default_inference_steps():
+    """Pick a step count the machine can actually live with.
+
+    Judged on VRAM rather than the MMGP profile: the profile describes how weights are streamed, and a
+    comfortable card is often on a conservative profile anyway, so keying on it would demote machines that
+    have the headroom. Profile 5 is the exception -- it exists to say the machine is genuinely tight.
+
+    Anything undetectable falls to the cheaper default, since being slow is a worse first impression than
+    being slightly soft, and the slider is right there.
+    """
+    try:
+        from mmgp import profile_type
+
+        from wgp import server_config
+
+        if int(server_config.get("profile", profile_type.LowRAM_LowVRAM)) == profile_type.VerylowRAM_LowVRAM:
+            return _STEPS_FAST
+    except Exception:
+        pass
+    try:
+        if not torch.cuda.is_available():
+            return _STEPS_FAST
+        vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+    except Exception:
+        return _STEPS_FAST
+    return _STEPS_SHARP if vram_gb >= _SHARP_STEPS_MIN_VRAM_GB else _STEPS_FAST
+
 
 def _snap_resolution(resolution):
     """Snap a requested canvas onto the grid H3 can actually sample, keeping its size and aspect.
@@ -375,7 +411,7 @@ class family_handler:
     def update_default_settings(base_model_type, model_def, ui_defaults):
         ui_defaults.update(
             {
-                "num_inference_steps": 20,
+                "num_inference_steps": _default_inference_steps(),
                 "video_length": 124,
                 "resolution": "864x480",
                 "guidance_scale": 1.0,

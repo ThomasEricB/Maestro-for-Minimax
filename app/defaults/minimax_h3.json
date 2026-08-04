@@ -8,7 +8,7 @@
         ]
     },
     "prompt": "A cinematic medium shot of a traveler standing on a windswept overlook at sunrise. The camera slowly arcs around them as their coat moves naturally in the breeze. Distant birds and soft wind are audible, and the traveler says, \"We made it.\"",
-    "num_inference_steps": 20,
+    "num_inference_steps": 30,
     "video_length": 124,
     "resolution": "864x480",
     "guidance_scale": 1.0,

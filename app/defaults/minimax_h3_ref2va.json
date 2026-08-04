@@ -8,7 +8,7 @@
         ]
     },
     "prompt": "A cinematic medium shot of the woman from the reference image walking through a rain-slicked night market, neon signs reflecting off the wet pavement. The camera tracks alongside her. Rain patters on awnings and distant chatter fills the street, and she says, \"I know this place.\"",
-    "num_inference_steps": 20,
+    "num_inference_steps": 30,
     "video_length": 124,
     "resolution": "864x480",
     "guidance_scale": 1.0,
