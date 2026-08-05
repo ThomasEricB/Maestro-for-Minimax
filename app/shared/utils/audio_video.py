@@ -24,14 +24,41 @@ def rand_name(length=8, suffix=''):
     return name
 
 
+# libsndfile's ceiling. Well above any real layout, so exceeding it means the array is the wrong way round
+# rather than genuinely multichannel.
+_MAX_AUDIO_CHANNELS = 1024
+
+
 def _prepare_audio_array(audio_data):
+    """Coerce audio into the frames-major `(frames,)` or `(frames, channels)` layout libsndfile writes.
+
+    Everything upstream has its own idea of audio layout -- decoders hand back channels-first, batched paths
+    carry a leading dimension of one -- and passing any of those to `sf.write` fails as "Format not
+    recognised", because libsndfile reads the first axis as a channel count and refuses e.g. 44100 channels.
+    That message names neither the shape nor the real problem, so normalise the layouts that can be
+    normalised, and refuse the rest with something a reader can act on.
+    """
     if torch.is_tensor(audio_data):
         audio_data = audio_data.detach().cpu().float().numpy()
     else:
         audio_data = np.asarray(audio_data, dtype=np.float32)
+    original_shape = audio_data.shape
+    # A batch axis of one: (1, frames, channels) or (1, channels, frames).
+    while audio_data.ndim > 2 and audio_data.shape[0] == 1:
+        audio_data = audio_data[0]
+    # A trailing axis of one: (channels, frames, 1).
+    while audio_data.ndim > 2 and audio_data.shape[-1] == 1:
+        audio_data = audio_data[..., 0]
+    if audio_data.ndim > 2:
+        raise ValueError(f"Audio must be 1-D or 2-D to be written, got shape {tuple(original_shape)}.")
     if audio_data.ndim == 2 and audio_data.shape[0] <= 8 and audio_data.shape[1] > audio_data.shape[0]:
         audio_data = audio_data.T
-    return audio_data
+    if audio_data.ndim == 2 and audio_data.shape[1] > _MAX_AUDIO_CHANNELS:
+        raise ValueError(
+            f"Audio has {audio_data.shape[1]} channels after normalizing shape {tuple(original_shape)}; "
+            "the array is most likely channels-first with more than 8 channels."
+        )
+    return np.ascontiguousarray(audio_data)
 
 
 def write_wav_file(path, audio_data, sample_rate):
