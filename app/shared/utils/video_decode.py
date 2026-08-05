@@ -203,7 +203,12 @@ def _build_hdr_tonemap_filter(metadata):
     return ["zscale=" + ":".join(zscale_parts), "format=gbrpf32le", "tonemap=reinhard", "zscale=t=bt709:p=bt709:m=bt709:r=limited"]
 
 
-def _build_corrected_video_filter(metadata, target_fps=None, start_frame=0, end_frame=None):
+# Above this many kept frames, listing them individually makes the filter expression more expensive than
+# the frames it saves -- and a request that large wants most of the clip anyway.
+_MAX_SELECT_EXPRESSION_FRAMES = 2000
+
+
+def _build_corrected_video_filter(metadata, target_fps=None, start_frame=0, end_frame=None, keep_offsets=None):
     filters = []
     if target_fps is not None and float(target_fps) > 0:
         filters.append(f"fps={float(target_fps):.12g}")
@@ -213,6 +218,13 @@ def _build_corrected_video_filter(metadata, target_fps=None, start_frame=0, end_
             trim_parts.append(f"end_frame={int(end_frame)}")
         filters.append("trim=" + ":".join(trim_parts))
         filters.append("setpts=PTS-STARTPTS")
+    # Drop the unwanted frames here, before the costly stages below. Resampling keeps a sparse handful
+    # spread across the clip, and without this every frame in between is still scaled, tonemapped and
+    # pushed down the pipe -- on a 4K HDR source that is hours of work to return a few dozen frames.
+    if keep_offsets is not None and 0 < len(keep_offsets) <= _MAX_SELECT_EXPRESSION_FRAMES:
+        wanted = sorted(set(int(offset) for offset in keep_offsets))
+        filters.append("select='" + "+".join(f"eq(n\\,{offset})" for offset in wanted) + "'")
+        filters.append("setpts=N/FRAME_RATE/TB")
     if metadata["needs_sar_fix"]:
         filters += [f"scale={int(metadata['display_width'])}:{int(metadata['display_height'])}:flags=lanczos", "setsar=1"]
     if metadata["needs_tonemap"]:
@@ -254,11 +266,18 @@ def _decode_contiguous_video_frames_ffmpeg(video_path, start_frame, max_frames, 
     if max_frames <= 0:
         empty = np.empty((0, metadata["display_height"], metadata["display_width"], 3), dtype=np.uint8)
         return torch.from_numpy(empty) if bridge == "torch" else empty
-    video_filter = _build_corrected_video_filter(metadata, start_frame=start_frame, end_frame=start_frame + max_frames)
+    video_filter = _build_corrected_video_filter(
+        metadata, start_frame=start_frame, end_frame=start_frame + max_frames, keep_offsets=keep_offsets
+    )
+    # When `select` is in the graph ffmpeg emits only the wanted frames, once each, in order -- so the
+    # number to expect is the count of distinct offsets, not the span they lie across.
+    selecting = keep_offsets is not None and "select=" in video_filter
+    emitted_offsets = sorted(set(int(offset) for offset in keep_offsets)) if selecting else None
+    expected_frames = len(emitted_offsets) if selecting else max_frames
     cmd = [ffmpeg_path, "-v", "error", "-nostdin", "-threads", "0", "-i", os.fspath(video_path), "-an", "-sn"]
     if len(video_filter) > 0:
         cmd += ["-vf", video_filter]
-    cmd += ["-fps_mode", "passthrough", "-frames:v", str(max_frames), "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"]
+    cmd += ["-fps_mode", "passthrough", "-frames:v", str(expected_frames), "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"]
     process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=10**7)
     frame_bytes = metadata["display_width"] * metadata["display_height"] * 3
     # Where each decoded offset should land in the output. A resampled request can name the same source
@@ -271,23 +290,26 @@ def _decode_contiguous_video_frames_ffmpeg(video_path, start_frame, max_frames, 
     out_frames = max_frames if keep_offsets is None else len(keep_offsets)
     frames = np.empty((out_frames, metadata["display_height"], metadata["display_width"], 3), dtype=np.uint8)
     frame_count = 0
-    decoded_offset = 0
+    read_index = 0
     highest_slot = -1
     try:
-        while decoded_offset < max_frames:
+        while read_index < expected_frames:
             raw_frame = _read_exact(process.stdout, frame_bytes)
             if raw_frame is None or len(raw_frame) < frame_bytes:
                 break
-            slots = None if slots_by_offset is None else slots_by_offset.get(decoded_offset)
+            # Without `select` the stream is every frame in the span, so position is the offset. With it,
+            # ffmpeg emits only the wanted offsets in order, so the nth frame read is the nth of those.
+            offset = emitted_offsets[read_index] if selecting else read_index
+            slots = None if slots_by_offset is None else slots_by_offset.get(offset)
             if slots_by_offset is None:
-                frames[decoded_offset] = np.frombuffer(raw_frame, dtype=np.uint8).reshape(metadata["display_height"], metadata["display_width"], 3)
-                highest_slot = decoded_offset
+                frames[offset] = np.frombuffer(raw_frame, dtype=np.uint8).reshape(metadata["display_height"], metadata["display_width"], 3)
+                highest_slot = offset
             elif slots:
                 frame = np.frombuffer(raw_frame, dtype=np.uint8).reshape(metadata["display_height"], metadata["display_width"], 3)
                 for slot in slots:
                     frames[slot] = frame
                     highest_slot = max(highest_slot, slot)
-            decoded_offset += 1
+            read_index += 1
             frame_count = highest_slot + 1
         stderr = process.stderr.read().decode("utf-8", errors="ignore").strip()
         return_code = process.wait()
