@@ -233,7 +233,15 @@ def _read_exact(stream, size):
     return buf
 
 
-def _decode_contiguous_video_frames_ffmpeg(video_path, start_frame, max_frames, bridge="torch"):
+def _decode_contiguous_video_frames_ffmpeg(video_path, start_frame, max_frames, bridge="torch", keep_offsets=None):
+    """Decode `max_frames` frames from `start_frame`.
+
+    `keep_offsets` names which of those frames to actually return, as offsets from `start_frame`. Frames
+    still have to be decoded in order -- that is what "contiguous" means here -- but only the wanted ones
+    are held, so the buffer is sized by what the caller asked for rather than by the span it lies across.
+    Resampling a long clip picks sparse frames spread end to end, and materializing everything between them
+    is what turns a 4K source into a 138 GB allocation.
+    """
     metadata = probe_video_stream_metadata(video_path)
     if metadata is None:
         raise RuntimeError(f"Unable to probe video metadata for {video_path}")
@@ -253,15 +261,34 @@ def _decode_contiguous_video_frames_ffmpeg(video_path, start_frame, max_frames, 
     cmd += ["-fps_mode", "passthrough", "-frames:v", str(max_frames), "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"]
     process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=10**7)
     frame_bytes = metadata["display_width"] * metadata["display_height"] * 3
-    frames = np.empty((max_frames, metadata["display_height"], metadata["display_width"], 3), dtype=np.uint8)
+    # Where each decoded offset should land in the output. A resampled request can name the same source
+    # frame more than once when it upsamples, so an offset maps to a list of slots, not one.
+    slots_by_offset = None
+    if keep_offsets is not None:
+        slots_by_offset = {}
+        for slot, offset in enumerate(keep_offsets):
+            slots_by_offset.setdefault(int(offset), []).append(slot)
+    out_frames = max_frames if keep_offsets is None else len(keep_offsets)
+    frames = np.empty((out_frames, metadata["display_height"], metadata["display_width"], 3), dtype=np.uint8)
     frame_count = 0
+    decoded_offset = 0
+    highest_slot = -1
     try:
-        while frame_count < max_frames:
+        while decoded_offset < max_frames:
             raw_frame = _read_exact(process.stdout, frame_bytes)
             if raw_frame is None or len(raw_frame) < frame_bytes:
                 break
-            frames[frame_count] = np.frombuffer(raw_frame, dtype=np.uint8).reshape(metadata["display_height"], metadata["display_width"], 3)
-            frame_count += 1
+            slots = None if slots_by_offset is None else slots_by_offset.get(decoded_offset)
+            if slots_by_offset is None:
+                frames[decoded_offset] = np.frombuffer(raw_frame, dtype=np.uint8).reshape(metadata["display_height"], metadata["display_width"], 3)
+                highest_slot = decoded_offset
+            elif slots:
+                frame = np.frombuffer(raw_frame, dtype=np.uint8).reshape(metadata["display_height"], metadata["display_width"], 3)
+                for slot in slots:
+                    frames[slot] = frame
+                    highest_slot = max(highest_slot, slot)
+            decoded_offset += 1
+            frame_count = highest_slot + 1
         stderr = process.stderr.read().decode("utf-8", errors="ignore").strip()
         return_code = process.wait()
     finally:
@@ -287,11 +314,15 @@ def decode_video_frames_ffmpeg(video_path, start_frame, max_frames, target_fps=N
         empty = np.empty((0, metadata["display_height"], metadata["display_width"], 3), dtype=np.uint8)
         return torch.from_numpy(empty) if bridge == "torch" else empty
     decode_start = frame_nos[0]
-    decoded = _decode_contiguous_video_frames_ffmpeg(video_path, decode_start, frame_nos[-1] - decode_start + 1, bridge)
-    index_list = [frame_no - decode_start for frame_no in frame_nos if frame_no - decode_start < decoded.shape[0]]
-    if bridge == "torch":
-        return decoded[index_list]
-    return decoded[index_list]
+    # The wanted frames go straight into the buffer as they stream past. Selecting them afterwards meant
+    # holding every frame between the first and the last, which for a resampled 4K source is the whole clip.
+    return _decode_contiguous_video_frames_ffmpeg(
+        video_path,
+        decode_start,
+        frame_nos[-1] - decode_start + 1,
+        bridge,
+        keep_offsets=[frame_no - decode_start for frame_no in frame_nos],
+    )
 
 
 def get_video_summary_extras(video_path):
