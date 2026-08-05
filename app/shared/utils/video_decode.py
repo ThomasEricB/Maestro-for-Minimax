@@ -60,7 +60,43 @@ def _resample_frame_indices(video_fps, video_frames_count, max_target_frames_cou
     return frame_ids[:max_target_frames_count]
 
 
-def _resolve_media_binary(binary_name: str):
+@lru_cache(maxsize=8)
+def _bundled_ffmpeg_binary():
+    """The ffmpeg that ships inside the environment, via imageio-ffmpeg.
+
+    Already a dependency -- `save_video` writes through imageio -- and its static build carries the filters
+    a distribution ffmpeg often leaves out.
+    """
+    try:
+        import imageio_ffmpeg
+
+        path = imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return None
+    return path if path and os.path.isfile(path) else None
+
+
+@lru_cache(maxsize=32)
+def _ffmpeg_has_filter(ffmpeg_path: str, filter_name: str) -> bool:
+    """Whether this ffmpeg was built with a given filter. Cached, since asking costs a subprocess."""
+    try:
+        listing = subprocess.run(
+            [ffmpeg_path, "-hide_banner", "-filters"],
+            capture_output=True, text=True, timeout=20,
+        ).stdout
+    except Exception:
+        return False
+    return any(line.split()[1:2] == [filter_name] for line in listing.splitlines() if line.split())
+
+
+def _resolve_media_binary(binary_name: str, require_filter: str = None):
+    """Locate ffmpeg/ffprobe, preferring one that can actually do the job.
+
+    `require_filter` matters because filters are build-time options. Conda's ffmpeg is routinely built
+    without libzimg, so `zscale` is absent and the HDR tonemap chain dies with "No such filter" on a machine
+    whose ffmpeg is installed and works for everything else. Rather than fail, fall back to the build
+    bundled in the environment, which has it.
+    """
     env_map = {"ffmpeg": "FFMPEG_BINARY", "ffprobe": "FFPROBE_BINARY", "ffplay": "FFPLAY_BINARY"}
     binary_path = os.environ.get(env_map.get(binary_name, ""), "")
     if len(binary_path) > 0 and os.path.isfile(binary_path):
@@ -69,7 +105,15 @@ def _resolve_media_binary(binary_name: str):
     candidate = os.path.join(repo_root, "ffmpeg_bins", binary_name + (".exe" if os.name == "nt" else ""))
     if os.path.isfile(candidate):
         return candidate
-    return shutil.which(binary_name + (".exe" if os.name == "nt" else "")) or shutil.which(binary_name)
+    resolved = shutil.which(binary_name + (".exe" if os.name == "nt" else "")) or shutil.which(binary_name)
+    if binary_name != "ffmpeg":
+        return resolved
+    if resolved is not None and (require_filter is None or _ffmpeg_has_filter(resolved, require_filter)):
+        return resolved
+    bundled = _bundled_ffmpeg_binary()
+    if bundled is not None and (require_filter is None or _ffmpeg_has_filter(bundled, require_filter)):
+        return bundled
+    return resolved
 
 
 @lru_cache(maxsize=128)
@@ -193,7 +237,9 @@ def _decode_contiguous_video_frames_ffmpeg(video_path, start_frame, max_frames, 
     metadata = probe_video_stream_metadata(video_path)
     if metadata is None:
         raise RuntimeError(f"Unable to probe video metadata for {video_path}")
-    ffmpeg_path = _resolve_media_binary("ffmpeg")
+    # Only the tonemap chain needs zscale, so only ask for it when this clip is HDR -- a plain SAR fix has
+    # no reason to reject the ffmpeg already on PATH.
+    ffmpeg_path = _resolve_media_binary("ffmpeg", require_filter="zscale" if metadata["needs_tonemap"] else None)
     if ffmpeg_path is None:
         raise RuntimeError("ffmpeg binary not found")
     max_frames = int(max_frames)
