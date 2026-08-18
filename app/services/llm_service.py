@@ -1420,8 +1420,8 @@ def _ensure_llama_server(bin_dir: str, device: str = "cpu") -> None:
 
     Picks the appropriate prebuilt binary for the current platform:
       - Windows + CUDA (default for Maestro on NVIDIA): bin-win-cuda-12.4-x64.zip
-      - Linux CPU: bin-ubuntu-x64.tar.gz (CPU-only)
-      - Linux CUDA: build/cache the matching upstream release with GGML_CUDA
+      - Linux: bin-ubuntu-vulkan-x64.tar.gz (GPU offload via Vulkan; llama.cpp
+        ships no Linux CUDA build and the plain x64 asset is CPU-only)
       - macOS / AMD: not supported by Maestro itself (Pinokio install gates these),
         but if someone gets here, raise with a clear message.
 
@@ -1525,8 +1525,13 @@ def _ensure_llama_server(bin_dir: str, device: str = "cpu") -> None:
     #      but a manual install or weird env may not have it on PATH.
     #      Putting them next to llama-server.exe lets it find them
     #      regardless of system state.
-    # Linux's Ubuntu archive is CPU-only. For CUDA, resolve the same release
-    # tag below but build its source rather than downloading that archive.
+    # Linux: just one asset — bin-ubuntu-vulkan-x64.tar.gz. llama.cpp
+    # publishes NO CUDA build for Linux (the ubuntu assets are x64,
+    # arm64, vulkan-*, sycl-*, openvino, s390x), and plain
+    # bin-ubuntu-x64.tar.gz is CPU-only: it carries no GPU backend, so
+    # --n-gpu-layers silently does nothing and the enhancer runs entirely
+    # on CPU. The Vulkan build offloads to any modern GPU (NVIDIA included)
+    # through the driver's Vulkan ICD, needing no CUDA toolkit at runtime.
     #
     # Both assets are matched by:
     #   (must_start_with, must_contain)
@@ -1541,7 +1546,7 @@ def _ensure_llama_server(bin_dir: str, device: str = "cpu") -> None:
             asset_specs.append(("cudart-", "bin-win-cuda-12.4-x64.zip"))
         archive_ext = ".zip"
     else:  # linux
-        asset_specs = [("llama-", "bin-ubuntu-x64.tar.gz")]
+        asset_specs = [("llama-", "bin-ubuntu-vulkan-x64.tar.gz")]
         archive_ext = ".tar.gz"
 
     # Query GitHub for the latest release. llama.cpp's current stable release
