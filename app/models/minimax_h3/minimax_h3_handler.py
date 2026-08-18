@@ -46,7 +46,23 @@ _WANGP_REF2VA_PRUNED_BF16_TRANSFORMER = (
 # the entire available VRAM budget.  ``workingVRAM`` reserves this amount
 # independently of the user's card size; MMGP streams more transformer
 # blocks on smaller cards instead of starving the first denoising step.
-_TRANSFORMER_WORKING_VRAM_MB = 10 * 1024
+#
+# 12 GB rather than the 480p-derived 10 GB.  compute_h3_weight_budget()
+# spends a larger card's surplus entirely on resident weights while holding
+# the activation workspace flat, so at 1248x704 x 345 a 31.4 GB card planned
+# 15.6 GB of weights against the same 15.1 GB workspace a 24 GB card gets --
+# and attention needs query, key and value for the whole packed sequence at
+# once, ~1.2 GB apiece at 90k rows.  Both plans leave only ~1 GB of slack,
+# which the CUDA context and any other process on the display GPU consume,
+# so the first block of the first step died allocating ``key``.
+#
+# This baseline feeds both MMGP's workingVRAM and the planner's reserve, and
+# the planner amplifies it, so it is deliberately not the 16 GB that fixed
+# this before the planner existed -- that now collapses residency to 6.7 GB
+# and streams nearly every block.  At 12 GB the same job keeps 12.6 GB
+# resident against a 17.7 GB workspace: still more resident weight than the
+# 24 GB card that completes this pass, with 2.6 GB more room than it has.
+_TRANSFORMER_WORKING_VRAM_MB = 12 * 1024
 
 # H3's video VAE accepts 17*n+5 pixel frames. 345 is the final valid
 # frame count at or below the official 15-second limit (14.375s at 24fps).
