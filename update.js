@@ -5,7 +5,7 @@ const {
 module.exports = async (kernel) => {
   const runtime = runtimeProfile(kernel)
   const alreadyCurrentAndReady =
-    `{{/already up[- ]to[- ]date/i.test(input.stdout) && exists('${runtime.marker}') && exists('${runtime.flashMarker}') ? 'uptodate' : 'build'}}`
+    `{{/already up[- ]to[- ]date|is up to date/i.test(input.stdout) && exists('${runtime.marker}') && exists('${runtime.flashMarker}') ? 'uptodate' : 'build'}}`
   return {
     run: [{
     // Pull the latest launcher + app code (single monorepo, so this one
@@ -14,17 +14,35 @@ module.exports = async (kernel) => {
     // new to install or rebuild, so we skip straight to the end instead
     // of spending several minutes on a redundant dependency install +
     // UI build.
+    //
+    // --rebase, not a plain merge: this install carries local fixes
+    // committed on top of upstream (the Vulkan llama.cpp asset, fp8-only
+    // H3 pinning, expandable CUDA segments, the inference_mode save fix
+    // and the llama.cpp SONAME repair). A merge would bury them under
+    // merge commits and let an upstream edit to the same lines quietly
+    // win. Rebasing replays them onto each new release so they keep
+    // applying -- and if one ever stops applying, the rebase stops
+    // loudly instead of dropping the fix on the floor.
+    //
+    // --autostash so an uncommitted experiment in the tree cannot block
+    // the update; it is reapplied once the rebase lands.
+    //
+    // `|| git rebase --abort` keeps a conflicted rebase from stranding
+    // the repo mid-rebase: the tree is restored exactly as it was and the
+    // conflict stays visible in the terminal to resolve by hand.
     method: "shell.run",
     params: {
-      message: "git pull"
+      message: "git pull --rebase --autostash || git rebase --abort"
     }
   }, {
     // Branch on the git pull output (captured here as input.stdout — a
     // shell.run always returns its raw terminal content as stdout):
     //   - already current  -> jump to "uptodate" (log a notice, then end)
     //   - new commits found -> jump to "build"   (run the full update)
-    // Matches both the modern "Already up to date" and the older git
-    // "Already up-to-date" spelling, case-insensitively. If detection
+    // Matches the merge wording "Already up to date", the older git
+    // "Already up-to-date" spelling, and "Current branch <name> is up to
+    // date" — which is what `git pull --rebase` prints instead — all
+    // case-insensitively. If detection
     // ever fails (e.g. empty stdout), the regex simply won't match and
     // we fall through to "build" — the safe default is a full update,
     // never a wrongly-skipped rebuild.
