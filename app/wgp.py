@@ -136,6 +136,9 @@ _HANDLER_MODULES = [
     "shared.qtypes.nunchaku_int4",
     "shared.qtypes.nunchaku_fp4",
     "shared.qtypes.gguf",
+    # DeepBeepMeep's H3 checkpoints are INT8 with a Hadamard rotation applied in groups of 256;
+    # without this handler their weights decode to noise.
+    "shared.qtypes.int8_convrot",
 ]
 quant_router.unregister_handler(".fp8_quanto_bridge")
 for handler in _HANDLER_MODULES:

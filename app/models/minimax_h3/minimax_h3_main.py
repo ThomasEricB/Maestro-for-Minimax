@@ -8,7 +8,9 @@ Comfy-Org's compact consumer weights on machines that cannot hold the full
 
 from __future__ import annotations
 
+import json
 import os
+import struct
 from contextlib import nullcontext
 
 import numpy as np
@@ -262,9 +264,32 @@ def _tensor_to_pil(image) -> Image.Image | None:
     return Image.fromarray(pixels).convert("RGB")
 
 
+def _adaln_curve_shape(filename: str) -> tuple[int, int] | None:
+    """Read the AdaLN curve table's shape straight from the checkpoint header.
+
+    The compact checkpoints replace the AdaLN timestep projections with sampled low-rank curves, and how
+    aggressively they do that is a property of the file, not of the architecture: Comfy-Org's pruned build
+    stores a 1025x8 table, DeepBeepMeep's a 1001x64 one. Constructing the model on a fixed guess makes the
+    other checkpoint fail with fifty-odd size mismatches, so take the shape from the file.
+    """
+    try:
+        with open(filename, "rb") as handle:
+            header_length = struct.unpack("<Q", handle.read(8))[0]
+            header = json.loads(handle.read(header_length))
+    except (OSError, ValueError, struct.error):
+        return None
+    entry = header.get("adaln_t_table")
+    shape = entry.get("shape") if isinstance(entry, dict) else None
+    if not shape or len(shape) != 2:
+        return None
+    return int(shape[0]), int(shape[1])
+
+
 def _load_transformer(filename: str, dtype: torch.dtype) -> MiniMaxH3Transformer:
+    curve_shape = _adaln_curve_shape(filename)
+    curve_kwargs = {} if curve_shape is None else {"curve_grid": curve_shape[0], "curve_dim": curve_shape[1]}
     with init_empty_weights(include_buffers=True):
-        transformer = MiniMaxH3Transformer(dtype=dtype)
+        transformer = MiniMaxH3Transformer(dtype=dtype, **curve_kwargs)
     offload.load_model_data(
         transformer,
         filename,
