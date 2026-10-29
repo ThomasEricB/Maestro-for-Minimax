@@ -15,7 +15,35 @@ module.exports = {
       start: info.running("start.js"),
       start_classic: info.running("start_classic.js"),
       update: info.running("update.js"),
-      reset: info.running("reset.js")
+      reset: info.running("reset.js"),
+      prompt_studio: info.running("prompt_studio.js")
+    }
+    // The H3 prompt studio drives Maestro's own LLM endpoints. Maestro's port is assigned at launch, so
+    // the URL is handed over as a param rather than guessed.
+    let studio = running.prompt_studio ? info.local("prompt_studio.js") : null
+    let studioUp = !!(studio && studio.url)
+    // Pinokio auto-selects whichever item carries `default`, and re-renders this menu every time a
+    // script's state changes. While `default` sat on Maestro's Web UI, launching the studio re-rendered
+    // the menu and the selection snapped straight back to Maestro — the studio tab was present, just
+    // never selected, which looks exactly like the button "opening Maestro". So the default follows the
+    // studio while it is up, and returns to Maestro once it stops.
+    let studioMenu = (maestroUrl) => {
+      if (studioUp) {
+        return [{
+          default: true,
+          icon: "fa-solid fa-comment-dots",
+          text: "Open H3 Prompt Studio",
+          href: studio.url,
+        }]
+      }
+      return [{
+        icon: "fa-solid fa-comment-dots",
+        text: running.prompt_studio ? "Starting H3 Prompt Studio" : "H3 Prompt Studio",
+        href: "prompt_studio.js",
+        // Only pass an address when there is one. A `null` here reaches the script as the *string*
+        // "null", which is truthy, so it defeated the fallback and became the studio's Maestro address.
+        params: maestroUrl ? { maestro: maestroUrl } : {}
+      }]
     }
     if (running.install) {
       return [{
@@ -29,7 +57,9 @@ module.exports = {
         let local = info.local("start.js")
         if (local && local.url) {
           return [{
-            default: true,
+            // Yields the default to the studio while that is open, so starting it does not bounce the
+            // view straight back here.
+            default: !studioUp,
             icon: "fa-solid fa-rocket",
             text: "Open Web UI",
             href: local.url,
@@ -37,7 +67,7 @@ module.exports = {
             icon: "fa-solid fa-rocket",
             text: "Open Classic UI",
             href: local.url + "/classic",
-          }, {
+          }, ...studioMenu(local.url), {
             icon: 'fa-solid fa-terminal',
             text: "Terminal",
             href: "start.js",
@@ -92,7 +122,7 @@ module.exports = {
           icon: "fa-solid fa-display",
           text: "Start (Classic UI)",
           href: "start_classic.js",
-        }, {
+        }, ...studioMenu(null), {
           icon: "fa-solid fa-power-off",
           text: "Advanced",
           menu: [{

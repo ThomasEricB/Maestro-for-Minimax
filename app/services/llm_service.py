@@ -829,6 +829,10 @@ def get_status() -> dict:
         "model_id": _model_id or None,
         "device": _device if is_loaded() else None,
         "provider": _provider,
+        # Reported so callers can tell whether attaching an image will do anything: generate() silently
+        # drops images when the loaded model has no mmproj, which is indistinguishable from a model that
+        # simply ignored the picture.
+        "vision": bool(_vision_available and is_loaded()),
     }
 
 
@@ -879,12 +883,40 @@ def _llama_server_build(exe_path: str):
     return None
 
 
+def _vulkan_available() -> bool:
+    """Whether this Linux box can actually run the Vulkan build.
+
+    Needs both the loader and at least one installed driver (ICD); a loader with no ICD reports zero
+    devices, which would be a slower path to the same CPU-only result.
+    """
+    import ctypes.util
+    import glob as _glob
+    if not ctypes.util.find_library("vulkan"):
+        return False
+    return bool(_glob.glob("/usr/share/vulkan/icd.d/*.json")
+                or _glob.glob("/etc/vulkan/icd.d/*.json"))
+
+
+def _has_gpu_backend(bin_dir: str) -> bool:
+    """Whether an already-installed llama.cpp has any GPU backend library next to it."""
+    import glob as _glob
+    return bool(_glob.glob(os.path.join(bin_dir, "libggml-vulkan*"))
+                or _glob.glob(os.path.join(bin_dir, "libggml-cuda*"))
+                or _glob.glob(os.path.join(bin_dir, "ggml-vulkan*"))
+                or _glob.glob(os.path.join(bin_dir, "ggml-cuda*")))
+
+
 def _ensure_llama_server(bin_dir: str) -> None:
     """Auto-download llama-server from llama.cpp GitHub releases if missing.
 
     Picks the appropriate prebuilt binary for the current platform:
       - Windows + CUDA (default for Maestro on NVIDIA): bin-win-cuda-12.4-x64.zip
-      - Linux: bin-ubuntu-x64.tar.gz (includes CUDA backend if libs are present)
+      - Linux + GPU: bin-ubuntu-vulkan-x64.tar.gz. llama.cpp publishes NO CUDA
+        build for Linux, and bin-ubuntu-x64.tar.gz is CPU-only — it ships every
+        libggml-cpu-*.so and no GPU backend at all, so --n-gpu-layers has nothing
+        to offload onto and the model runs entirely on CPU. Vulkan is the only
+        prebuilt backend that reaches an NVIDIA card here.
+      - Linux without a Vulkan driver: bin-ubuntu-x64.tar.gz (CPU).
       - macOS / AMD: not supported by Maestro itself (Pinokio install gates these),
         but if someone gets here, raise with a clear message.
 
@@ -910,15 +942,25 @@ def _ensure_llama_server(bin_dir: str) -> None:
     is_linux = sys.platform.startswith("linux")
     exe_name = "llama-server.exe" if is_windows else "llama-server"
     exe_path = os.path.join(bin_dir, exe_name)
+    # A GPU box wants the Vulkan build; anything else is the CPU one.
+    want_gpu = is_linux and _vulkan_available()
     if os.path.isfile(exe_path):
         build = _llama_server_build(exe_path)
         # Keep the existing binary if it's new enough — or if its version is
         # unparseable (don't risk a re-download loop on an unknown build).
         # Only a KNOWN-too-old build triggers an upgrade.
-        if build is None or build >= MIN_LLAMA_BUILD:
+        fresh_enough = build is None or build >= MIN_LLAMA_BUILD
+        # ...but never keep a CPU-only install on a machine that can do better. Earlier versions of this
+        # function fetched the CPU asset on every Linux box, so an existing install is very likely to be
+        # the wrong one, and it is otherwise invisible: everything "works", just at CPU speed.
+        if want_gpu and not _has_gpu_backend(bin_dir):
+            print("[LLM] installed llama-server has no GPU backend; "
+                  "replacing it with the Vulkan build.")
+        elif fresh_enough:
             return
-        print(f"[LLM] llama-server build {build} < required {MIN_LLAMA_BUILD}; "
-              "upgrading to the latest llama.cpp release.")
+        elif not fresh_enough:
+            print(f"[LLM] llama-server build {build} < required {MIN_LLAMA_BUILD}; "
+                  "upgrading to the latest llama.cpp release.")
         # fall through to re-download (extractall below overwrites in place)
 
     if not (is_windows or is_linux):
@@ -958,8 +1000,10 @@ def _ensure_llama_server(bin_dir: str) -> None:
         ]
         archive_ext = ".zip"
     else:  # linux
+        # There is no bin-ubuntu-cuda asset in llama.cpp's releases — Vulkan is the GPU path on Linux,
+        # and it drives NVIDIA cards through the same driver stack.
         asset_specs = [
-            ("llama-", "bin-ubuntu-x64.tar.gz"),
+            ("llama-", "bin-ubuntu-vulkan-x64.tar.gz" if want_gpu else "bin-ubuntu-x64.tar.gz"),
         ]
         archive_ext = ".tar.gz"
 

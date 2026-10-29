@@ -6617,6 +6617,14 @@ async def llm_generate(request: Request):
     if not prompt:
         raise HTTPException(status_code=400, detail="prompt is required")
 
+    # Vision passthrough, following the same shape as the other endpoints here: unreadable paths are
+    # dropped rather than raised, so a stale reference degrades to a text-only answer instead of
+    # failing the whole request. generate() ignores images when the loaded model has no vision.
+    image_paths = body.get("image_paths") or []
+    if not image_paths and body.get("image_path"):
+        image_paths = [body["image_path"]]
+    image_paths = [p for p in image_paths if p and os.path.isfile(p)]
+
     _ensure_llm_loaded()
 
     try:
@@ -6627,6 +6635,7 @@ async def llm_generate(request: Request):
             temperature=body.get("temperature", 0.7),
             top_p=body.get("top_p", 0.9),
             seed=body.get("seed"),
+            image_paths=image_paths or None,
         )
         return {"text": result}
     except Exception as e:
